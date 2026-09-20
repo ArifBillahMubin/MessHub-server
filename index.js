@@ -60,6 +60,7 @@ async function run() {
     const userCollections = db.collection('users')
     const messCollections = db.collection('messes')
     const messMemberCollections = db.collection('messMembers')
+    const joinRequestCollections = db.collection('joinRequests')
 
 
 
@@ -306,6 +307,213 @@ async function run() {
 
 
 
+
+    // GET /users/my-mess — returns the mess document the current user is actively a member of
+    app.get('/users/my-mess', async (req, res) => {
+      const { email } = req.query
+      if (!email) return res.status(400).send({ message: 'Email is required.' })
+
+      const user = await userCollections.findOne({ email })
+      if (!user) return res.status(404).send({ message: 'User not found.' })
+      if (!user.hasMess) return res.send({ mess: null })
+
+      const membership = await messMemberCollections.findOne(
+        { userId: user._id, status: 'active' },
+        { sort: { joinedAt: -1 } }
+      )
+      if (!membership) return res.send({ mess: null })
+
+      const mess = await messCollections.findOne({ _id: membership.messId })
+      return res.send({ mess: mess || null, role: membership.role })
+    })
+
+    // GET /messes/find-by-code — look up a mess by its code (used by Join Mess page)
+    app.get('/messes/find-by-code', async (req, res) => {
+      const { code } = req.query
+      if (!code?.trim()) return res.status(400).send({ message: 'Mess code is required.' })
+
+      const mess = await messCollections.findOne({ messCode: code.trim().toUpperCase() })
+      if (!mess) return res.status(404).send({ message: 'No mess found with that code.' })
+      if (mess.status !== 'active') return res.status(400).send({ message: 'This mess is no longer active.' })
+
+      // Count active members so the frontend can show available seats
+      const activeMembers = await messMemberCollections.countDocuments({
+        messId: mess._id,
+        status: 'active',
+      })
+
+      return res.send({
+        _id: mess._id,
+        name: mess.name,
+        messCode: mess.messCode,
+        description: mess.description,
+        location: { address: mess.location?.address || '', city: mess.location?.city || '' },
+        maxMembers: mess.maxMembers,
+        activeMembers,
+        status: mess.status,
+      })
+    })
+
+    // POST /join-requests — submit a join request for a mess
+    app.post('/join-requests', async (req, res) => {
+      const { email, messCode, name, phone } = req.body
+      if (!email || !messCode) return res.status(400).send({ message: 'Email and mess code are required.' })
+
+      const user = await userCollections.findOne({ email })
+      if (!user) return res.status(404).send({ message: 'User not found.' })
+
+      if (user.hasMess) return res.status(409).send({ message: 'You are already part of a mess.' })
+
+      const mess = await messCollections.findOne({ messCode: messCode.trim().toUpperCase() })
+      if (!mess) return res.status(404).send({ message: 'Mess not found.' })
+      if (mess.status !== 'active') return res.status(400).send({ message: 'This mess is no longer active.' })
+
+      // Block if the mess is full
+      const activeCount = await messMemberCollections.countDocuments({ messId: mess._id, status: 'active' })
+      if (activeCount >= mess.maxMembers) {
+        return res.status(400).send({ message: 'This mess has reached its maximum member limit.' })
+      }
+
+      // Block duplicate pending requests
+      const existing = await joinRequestCollections.findOne({
+        userId: user._id,
+        messId: mess._id,
+        status: 'pending',
+      })
+      if (existing) return res.status(409).send({ message: 'You already have a pending request for this mess.' })
+
+      const now = new Date()
+      const joinRequest = {
+        messId: mess._id,
+        userId: user._id,
+        name: name?.trim() || user.name || '',
+        email: user.email,
+        phone: phone?.trim() || user.phone || '',
+        status: 'pending',
+        createdAt: now,
+        updatedAt: now,
+      }
+
+      const result = await joinRequestCollections.insertOne(joinRequest)
+      return res.status(201).send({ success: true, requestId: result.insertedId })
+    })
+
+    // GET /join-requests/my-pending — fetch the current user's pending requests (for MessSetup page)
+    app.get('/join-requests/my-pending', async (req, res) => {
+      const { email } = req.query
+      if (!email) return res.status(400).send({ message: 'Email is required.' })
+
+      const user = await userCollections.findOne({ email })
+      if (!user) return res.status(404).send({ message: 'User not found.' })
+
+      const requests = await joinRequestCollections
+        .aggregate([
+          { $match: { userId: user._id, status: { $in: ['pending', 'rejected'] } } },
+          { $sort: { createdAt: -1 } },
+          {
+            $lookup: {
+              from: 'messes',
+              localField: 'messId',
+              foreignField: '_id',
+              as: 'mess',
+            },
+          },
+          { $unwind: { path: '$mess', preserveNullAndEmpty: true } },
+          {
+            $project: {
+              _id: 1,
+              status: 1,
+              createdAt: 1,
+              messName: '$mess.name',
+              messCode: '$mess.messCode',
+            },
+          },
+        ])
+        .toArray()
+
+      return res.send(requests)
+    })
+
+    // GET /join-requests/mess/:messId — get all requests for a mess (manager view)
+    app.get('/join-requests/mess/:messId', async (req, res) => {
+      const { messId } = req.params
+      const { ObjectId } = require('mongodb')
+
+      let messObjectId
+      try { messObjectId = new ObjectId(messId) } catch { return res.status(400).send({ message: 'Invalid mess ID.' }) }
+
+      const requests = await joinRequestCollections
+        .find({ messId: messObjectId, status: 'pending' })
+        .sort({ createdAt: 1 })
+        .toArray()
+
+      return res.send(requests)
+    })
+
+    // PATCH /join-requests/:id/approve — manager approves a request
+    app.patch('/join-requests/:id/approve', async (req, res) => {
+      const { ObjectId } = require('mongodb')
+
+      let reqObjectId
+      try { reqObjectId = new ObjectId(req.params.id) } catch { return res.status(400).send({ message: 'Invalid request ID.' }) }
+
+      const joinReq = await joinRequestCollections.findOne({ _id: reqObjectId })
+      if (!joinReq) return res.status(404).send({ message: 'Join request not found.' })
+      if (joinReq.status !== 'pending') return res.status(400).send({ message: 'Request is no longer pending.' })
+
+      const mess = await messCollections.findOne({ _id: joinReq.messId })
+      if (!mess || mess.status !== 'active') return res.status(400).send({ message: 'Mess is not active.' })
+
+      // Re-check capacity before approving
+      const activeCount = await messMemberCollections.countDocuments({ messId: joinReq.messId, status: 'active' })
+      if (activeCount >= mess.maxMembers) {
+        return res.status(400).send({ message: 'Mess is now full. Cannot approve.' })
+      }
+
+      const now = new Date()
+
+      await joinRequestCollections.updateOne(
+        { _id: reqObjectId },
+        { $set: { status: 'approved', updatedAt: now } }
+      )
+
+      await messMemberCollections.insertOne({
+        userId: joinReq.userId,
+        messId: joinReq.messId,
+        role: 'member',
+        status: 'active',
+        joinedAt: now,
+        leftAt: null,
+        createdAt: now,
+        updatedAt: now,
+      })
+
+      await userCollections.updateOne(
+        { _id: joinReq.userId },
+        { $set: { hasMess: true, updatedAt: now } }
+      )
+
+      return res.send({ success: true, message: 'Request approved.' })
+    })
+
+    // PATCH /join-requests/:id/reject — manager rejects a request
+    app.patch('/join-requests/:id/reject', async (req, res) => {
+      const { ObjectId } = require('mongodb')
+
+      let reqObjectId
+      try { reqObjectId = new ObjectId(req.params.id) } catch { return res.status(400).send({ message: 'Invalid request ID.' }) }
+
+      const joinReq = await joinRequestCollections.findOne({ _id: reqObjectId })
+      if (!joinReq) return res.status(404).send({ message: 'Join request not found.' })
+      if (joinReq.status !== 'pending') return res.status(400).send({ message: 'Request is no longer pending.' })
+
+      await joinRequestCollections.updateOne(
+        { _id: reqObjectId },
+        { $set: { status: 'rejected', updatedAt: new Date() } }
+      )
+
+      return res.send({ success: true, message: 'Request rejected.' })
+    })
 
     // Send a ping to confirm a successful connection
     await client.db('admin').command({ ping: 1 })
