@@ -418,7 +418,7 @@ async function run() {
               as: 'mess',
             },
           },
-          { $unwind: { path: '$mess', preserveNullAndEmpty: true } },
+          { $unwind: { path: '$mess', preserveNullAndEmptyArrays: true } },
           {
             $project: {
               _id: 1,
@@ -513,6 +513,94 @@ async function run() {
       )
 
       return res.send({ success: true, message: 'Request rejected.' })
+    })
+
+    // GET /mess-members/:messId — paginated member list with search and role filter
+    app.get('/mess-members/:messId', async (req, res) => {
+      const { ObjectId } = require('mongodb')
+      const { search = '', role = '', page = '1', limit = '10' } = req.query
+
+      let messObjectId
+      try { messObjectId = new ObjectId(req.params.messId) }
+      catch { return res.status(400).send({ message: 'Invalid mess ID.' }) }
+
+      const mess = await messCollections.findOne({ _id: messObjectId })
+      if (!mess) return res.status(404).send({ message: 'Mess not found.' })
+
+      const pageNum = Math.max(1, parseInt(page))
+      const limitNum = Math.min(50, Math.max(1, parseInt(limit)))
+      const skip = (pageNum - 1) * limitNum
+
+      // Build the aggregation pipeline
+      const pipeline = [
+        // Only active members of this mess
+        { $match: { messId: messObjectId, status: 'active' } },
+
+        // Join user profile data
+        {
+          $lookup: {
+            from: 'users',
+            localField: 'userId',
+            foreignField: '_id',
+            as: 'user',
+          },
+        },
+        { $unwind: { path: '$user', preserveNullAndEmptyArrays: true } },
+
+        // Apply role filter (manager | member | '')
+        ...(role ? [{ $match: { role } }] : []),
+
+        // Apply text search against name, email, phone from the joined user
+        ...(search
+          ? [{
+              $match: {
+                $or: [
+                  { 'user.name':  { $regex: search, $options: 'i' } },
+                  { 'user.email': { $regex: search, $options: 'i' } },
+                  { 'user.phone': { $regex: search, $options: 'i' } },
+                ],
+              },
+            }]
+          : []),
+
+        // Project only the fields the frontend needs
+        {
+          $project: {
+            _id: 1,
+            role: 1,
+            status: 1,
+            joinedAt: 1,
+            name:     '$user.name',
+            email:    '$user.email',
+            phone:    '$user.phone',
+            photoURL: '$user.photoURL',
+          },
+        },
+        { $sort: { joinedAt: 1 } },
+      ]
+
+      // Run count and paginated data in parallel
+      const [countResult, members] = await Promise.all([
+        messMemberCollections.aggregate([...pipeline, { $count: 'total' }]).toArray(),
+        messMemberCollections.aggregate([...pipeline, { $skip: skip }, { $limit: limitNum }]).toArray(),
+      ])
+
+      const total = countResult[0]?.total ?? 0
+      const totalMembers = await messMemberCollections.countDocuments({ messId: messObjectId, status: 'active' })
+
+      return res.send({
+        members,
+        total,
+        page: pageNum,
+        limit: limitNum,
+        totalPages: Math.ceil(total / limitNum),
+        summary: {
+          totalMembers,
+          maxMembers: mess.maxMembers,
+          availableSeats: Math.max(0, mess.maxMembers - totalMembers),
+          messName: mess.name,
+        },
+      })
     })
 
     // Send a ping to confirm a successful connection
