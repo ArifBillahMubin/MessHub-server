@@ -61,6 +61,7 @@ async function run() {
     const messCollections = db.collection('messes')
     const messMemberCollections = db.collection('messMembers')
     const joinRequestCollections = db.collection('joinRequests')
+    const messPostCollections = db.collection('messPosts')
 
 
 
@@ -600,6 +601,432 @@ async function run() {
           availableSeats: Math.max(0, mess.maxMembers - totalMembers),
           messName: mess.name,
         },
+      })
+    })
+
+    // ── Mess Posts ────────────────────────────────────────────────────────────
+
+    // Helper: resolve the manager's active mess and verify ownership
+    const resolveManagerMess = async (email) => {
+      const { ObjectId } = require('mongodb')
+      const user = await userCollections.findOne({ email })
+      if (!user) return { error: 'User not found.', status: 404 }
+      if (!user.hasMess) return { error: 'You do not have an active mess.', status: 403 }
+      const membership = await messMemberCollections.findOne(
+        { userId: user._id, status: 'active', role: 'manager' },
+        { sort: { joinedAt: -1 } }
+      )
+      if (!membership) return { error: 'You are not a manager of any mess.', status: 403 }
+      const mess = await messCollections.findOne({ _id: membership.messId })
+      if (!mess) return { error: 'Mess not found.', status: 404 }
+      const activeMembers = await messMemberCollections.countDocuments({ messId: mess._id, status: 'active' })
+      return { user, mess, messId: mess._id, activeMembers }
+    }
+
+    // GET /mess-posts/mess/:messId — all posts for a mess
+    app.get('/mess-posts/mess/:messId', async (req, res) => {
+      const { ObjectId } = require('mongodb')
+      let messObjectId
+      try { messObjectId = new ObjectId(req.params.messId) }
+      catch { return res.status(400).send({ message: 'Invalid mess ID.' }) }
+
+      const posts = await messPostCollections
+        .find({ messId: messObjectId })
+        .sort({ updatedAt: -1 })
+        .toArray()
+      return res.send(posts)
+    })
+
+    // GET /mess-posts/:id — single post
+    app.get('/mess-posts/:id', async (req, res) => {
+      const { ObjectId } = require('mongodb')
+      let postId
+      try { postId = new ObjectId(req.params.id) }
+      catch { return res.status(400).send({ message: 'Invalid post ID.' }) }
+
+      const post = await messPostCollections.findOne({ _id: postId })
+      if (!post) return res.status(404).send({ message: 'Post not found.' })
+      return res.send(post)
+    })
+
+    // POST /mess-posts — create a post
+    app.post('/mess-posts', async (req, res) => {
+      const { email, title, description, advertisedSeats, messType, roomType, foodSystem,
+              facilities, approximateMonthlyCost, rent, additionalCost, costNote,
+              images, preferredMemberTypes, additionalInformation, status } = req.body
+
+      if (!email) return res.status(400).send({ message: 'Email is required.' })
+
+      const resolved = await resolveManagerMess(email)
+      if (resolved.error) return res.status(resolved.status).send({ message: resolved.error })
+      const { user, mess, messId, activeMembers } = resolved
+
+      const postStatus = status === 'published' ? 'published' : 'draft'
+      const seats = Number(advertisedSeats) || 0
+      const availableSeats = Math.max(0, mess.maxMembers - activeMembers)
+
+      // Validate for published posts
+      if (postStatus === 'published') {
+        if (!title?.trim()) return res.status(400).send({ message: 'Title is required to publish.' })
+        if (!description?.trim()) return res.status(400).send({ message: 'Description is required to publish.' })
+        if (!images || images.length === 0) return res.status(400).send({ message: 'At least one image is required to publish.' })
+        if (availableSeats <= 0) return res.status(400).send({ message: 'No available seats to advertise.' })
+        if (seats < 1 || seats > availableSeats) return res.status(400).send({ message: `Advertised seats must be between 1 and ${availableSeats}.` })
+      } else if (seats > 0 && seats > availableSeats) {
+        return res.status(400).send({ message: `Advertised seats cannot exceed available seats (${availableSeats}).` })
+      }
+
+      const now = new Date()
+      const newPost = {
+        messId,
+        createdBy: user._id,
+        title: title?.trim() || '',
+        description: description?.trim() || '',
+        advertisedSeats: seats,
+        messType: messType || '',
+        roomType: roomType || '',
+        foodSystem: foodSystem || '',
+        facilities: Array.isArray(facilities) ? facilities : [],
+        approximateMonthlyCost: Number(approximateMonthlyCost) || 0,
+        rent: Number(rent) || 0,
+        additionalCost: Number(additionalCost) || 0,
+        costNote: costNote?.trim() || '',
+        images: Array.isArray(images) ? images : [],
+        preferredMemberTypes: Array.isArray(preferredMemberTypes) ? preferredMemberTypes : [],
+        additionalInformation: additionalInformation?.trim() || '',
+        status: postStatus,
+        createdAt: now,
+        updatedAt: now,
+      }
+
+      const result = await messPostCollections.insertOne(newPost)
+      return res.status(201).send({ success: true, postId: result.insertedId, status: postStatus })
+    })
+
+    // PATCH /mess-posts/:id — update a post
+    app.patch('/mess-posts/:id', async (req, res) => {
+      const { ObjectId } = require('mongodb')
+      const { email, title, description, advertisedSeats, messType, roomType, foodSystem,
+              facilities, approximateMonthlyCost, rent, additionalCost, costNote,
+              images, preferredMemberTypes, additionalInformation, status } = req.body
+
+      if (!email) return res.status(400).send({ message: 'Email is required.' })
+
+      let postId
+      try { postId = new ObjectId(req.params.id) }
+      catch { return res.status(400).send({ message: 'Invalid post ID.' }) }
+
+      const resolved = await resolveManagerMess(email)
+      if (resolved.error) return res.status(resolved.status).send({ message: resolved.error })
+      const { mess, messId, activeMembers } = resolved
+
+      const post = await messPostCollections.findOne({ _id: postId })
+      if (!post) return res.status(404).send({ message: 'Post not found.' })
+      if (post.messId.toString() !== messId.toString()) return res.status(403).send({ message: 'This post does not belong to your mess.' })
+
+      const postStatus = status === 'published' ? 'published' : (status === 'draft' ? 'draft' : post.status)
+      const seats = advertisedSeats !== undefined ? Number(advertisedSeats) : post.advertisedSeats
+      const availableSeats = Math.max(0, mess.maxMembers - activeMembers)
+
+      if (postStatus === 'published') {
+        const finalTitle = (title !== undefined ? title?.trim() : post.title)
+        const finalDesc  = (description !== undefined ? description?.trim() : post.description)
+        const finalImages = images !== undefined ? images : post.images
+        if (!finalTitle) return res.status(400).send({ message: 'Title is required to publish.' })
+        if (!finalDesc)  return res.status(400).send({ message: 'Description is required to publish.' })
+        if (!finalImages || finalImages.length === 0) return res.status(400).send({ message: 'At least one image is required to publish.' })
+        if (availableSeats <= 0) return res.status(400).send({ message: 'No available seats to advertise.' })
+        if (seats < 1 || seats > availableSeats) return res.status(400).send({ message: `Advertised seats must be between 1 and ${availableSeats}.` })
+      } else if (seats > 0 && seats > availableSeats) {
+        return res.status(400).send({ message: `Advertised seats cannot exceed available seats (${availableSeats}).` })
+      }
+
+      const updates = { updatedAt: new Date(), status: postStatus }
+      if (title !== undefined)                 updates.title = title?.trim() || ''
+      if (description !== undefined)           updates.description = description?.trim() || ''
+      if (advertisedSeats !== undefined)       updates.advertisedSeats = seats
+      if (messType !== undefined)              updates.messType = messType
+      if (roomType !== undefined)              updates.roomType = roomType
+      if (foodSystem !== undefined)            updates.foodSystem = foodSystem
+      if (facilities !== undefined)            updates.facilities = Array.isArray(facilities) ? facilities : []
+      if (approximateMonthlyCost !== undefined) updates.approximateMonthlyCost = Number(approximateMonthlyCost) || 0
+      if (rent !== undefined)                  updates.rent = Number(rent) || 0
+      if (additionalCost !== undefined)        updates.additionalCost = Number(additionalCost) || 0
+      if (costNote !== undefined)              updates.costNote = costNote?.trim() || ''
+      if (images !== undefined)                updates.images = Array.isArray(images) ? images : []
+      if (preferredMemberTypes !== undefined)  updates.preferredMemberTypes = Array.isArray(preferredMemberTypes) ? preferredMemberTypes : []
+      if (additionalInformation !== undefined) updates.additionalInformation = additionalInformation?.trim() || ''
+
+      await messPostCollections.updateOne({ _id: postId }, { $set: updates })
+      return res.send({ success: true, status: postStatus })
+    })
+
+    // DELETE /mess-posts/:id — delete a post
+    app.delete('/mess-posts/:id', async (req, res) => {
+      const { ObjectId } = require('mongodb')
+      const { email } = req.query
+
+      if (!email) return res.status(400).send({ message: 'Email is required.' })
+
+      let postId
+      try { postId = new ObjectId(req.params.id) }
+      catch { return res.status(400).send({ message: 'Invalid post ID.' }) }
+
+      const resolved = await resolveManagerMess(email)
+      if (resolved.error) return res.status(resolved.status).send({ message: resolved.error })
+      const { messId } = resolved
+
+      const post = await messPostCollections.findOne({ _id: postId })
+      if (!post) return res.status(404).send({ message: 'Post not found.' })
+      if (post.messId.toString() !== messId.toString()) return res.status(403).send({ message: 'This post does not belong to your mess.' })
+
+      await messPostCollections.deleteOne({ _id: postId })
+      return res.send({ success: true, message: 'Post deleted.' })
+    })
+
+    // GET /public-mess-posts — public browsing endpoint (no auth required)
+    app.get('/public-mess-posts', async (req, res) => {
+      const {
+        q = '',
+        area = '', city = '',
+        messType = '', roomType = '', foodSystem = '',
+        minCost = '', maxCost = '',
+        minSeats = '',
+        facilities = '',
+        preferredMemberType = '',
+        sort = 'newest',
+        page = '1', limit = '12',
+      } = req.query
+
+      const pageNum  = Math.max(1, parseInt(page) || 1)
+      const limitNum = Math.min(24, Math.max(1, parseInt(limit) || 12))
+      const skip = (pageNum - 1) * limitNum
+
+      // Validate sort value
+      const validSorts = ['newest', 'lowest_cost', 'available_seats']
+      const safeSort = validSorts.includes(sort) ? sort : 'newest'
+
+      const pipeline = [
+        // 1 — only published posts
+        { $match: { status: 'published' } },
+
+        // 2 — join mess data
+        {
+          $lookup: {
+            from: 'messes',
+            localField: 'messId',
+            foreignField: '_id',
+            as: 'messData',
+          },
+        },
+        { $unwind: { path: '$messData', preserveNullAndEmptyArrays: false } },
+
+        // 3 — only active messes
+        { $match: { 'messData.status': 'active' } },
+
+        // 4 — count active members for this mess
+        {
+          $lookup: {
+            from: 'messMembers',
+            let: { mid: '$messId' },
+            pipeline: [
+              { $match: { $expr: { $and: [{ $eq: ['$messId', '$$mid'] }, { $eq: ['$status', 'active'] }] } } },
+              { $count: 'count' },
+            ],
+            as: 'memberCount',
+          },
+        },
+        {
+          $addFields: {
+            activeMembers: { $ifNull: [{ $arrayElemAt: ['$memberCount.count', 0] }, 0] },
+          },
+        },
+        {
+          $addFields: {
+            actualAvailableSeats: {
+              $max: [0, { $subtract: ['$messData.maxMembers', '$activeMembers'] }],
+            },
+          },
+        },
+
+        // 5 — only posts with actual available seats AND advertisedSeats > 0
+        // advertisedSeats must also be <= actualAvailableSeats (enforced at creation, double-check here)
+        { $match: { actualAvailableSeats: { $gt: 0 }, advertisedSeats: { $gt: 0 } } },
+        { $match: { $expr: { $lte: ['$advertisedSeats', '$actualAvailableSeats'] } } },
+
+        // 6 — text search across mess name and location
+        ...(q ? [{
+          $match: {
+            $or: [
+              { 'messData.name':             { $regex: q, $options: 'i' } },
+              { 'messData.location.area':    { $regex: q, $options: 'i' } },
+              { 'messData.location.city':    { $regex: q, $options: 'i' } },
+              { 'messData.location.address': { $regex: q, $options: 'i' } },
+              { title:                        { $regex: q, $options: 'i' } },
+            ],
+          },
+        }] : []),
+
+        // 7 — location filters
+        ...(area ? [{ $match: { 'messData.location.area': { $regex: area, $options: 'i' } } }] : []),
+        ...(city ? [{ $match: { 'messData.location.city': { $regex: city, $options: 'i' } } }] : []),
+
+        // 8 — type filters
+        ...(messType ? [{ $match: { messType } }] : []),
+        ...(roomType ? [{ $match: { roomType } }] : []),
+        ...(foodSystem ? [{ $match: { foodSystem } }] : []),
+
+        // 9 — budget filter
+        ...(minCost ? [{ $match: { approximateMonthlyCost: { $gte: Number(minCost) } } }] : []),
+        ...(maxCost ? [{ $match: { approximateMonthlyCost: { $lte: Number(maxCost) } } }] : []),
+
+        // 10 — minimum seats filter uses advertisedSeats (public recruitment value)
+        ...(minSeats ? [{ $match: { advertisedSeats: { $gte: Number(minSeats) } } }] : []),
+
+        // 11 — facilities filter (all selected must be present)
+        ...(facilities ? (() => {
+          const list = facilities.split(',').map(f => f.trim()).filter(Boolean)
+          return list.length ? [{ $match: { facilities: { $all: list } } }] : []
+        })() : []),
+
+        // 12 — preferred member type
+        ...(preferredMemberType ? [{ $match: { preferredMemberTypes: preferredMemberType } }] : []),
+
+        // 13 — project public fields only
+        {
+          $project: {
+            _id: 1,
+            title: 1,
+            description: 1,
+            advertisedSeats: 1,
+            messType: 1,
+            roomType: 1,
+            foodSystem: 1,
+            facilities: 1,
+            approximateMonthlyCost: 1,
+            rent: 1,
+            additionalCost: 1,
+            costNote: 1,
+            images: 1,
+            preferredMemberTypes: 1,
+            additionalInformation: 1,
+            status: 1,
+            createdAt: 1,
+            updatedAt: 1,
+            activeMembers: 1,
+            actualAvailableSeats: 1,
+            mess: {
+              _id: '$messData._id',
+              name: '$messData.name',
+              maxMembers: '$messData.maxMembers',
+              location: {
+                address: '$messData.location.address',
+                area: '$messData.location.area',
+                city: '$messData.location.city',
+                cityCorporation: '$messData.location.cityCorporation',
+                latitude: '$messData.location.latitude',
+                longitude: '$messData.location.longitude',
+              },
+            },
+          },
+        },
+      ]
+
+      // Sort stage
+      const sortStage = {
+        newest:         { $sort: { updatedAt: -1 } },
+        lowest_cost:    { $sort: { approximateMonthlyCost: 1, updatedAt: -1 } },
+        available_seats:{ $sort: { advertisedSeats: -1, updatedAt: -1 } },
+      }[safeSort]
+
+      const [countResult, data] = await Promise.all([
+        messPostCollections.aggregate([...pipeline, { $count: 'total' }]).toArray(),
+        messPostCollections.aggregate([...pipeline, sortStage, { $skip: skip }, { $limit: limitNum }]).toArray(),
+      ])
+
+      const total = countResult[0]?.total ?? 0
+
+      return res.send({
+        data,
+        pagination: {
+          page: pageNum,
+          limit: limitNum,
+          total,
+          totalPages: Math.ceil(total / limitNum),
+        },
+      })
+    })
+
+    // GET /public-mess-posts/:id — single published post for the public details page
+    app.get('/public-mess-posts/:id', async (req, res) => {
+      const { ObjectId } = require('mongodb')
+      let postId
+      try { postId = new ObjectId(req.params.id) }
+      catch { return res.status(400).send({ message: 'Invalid post ID.' }) }
+
+      const post = await messPostCollections.findOne({ _id: postId, status: 'published' })
+      if (!post) return res.status(404).send({ message: 'Post not found or not published.' })
+
+      const mess = await messCollections.findOne({ _id: post.messId })
+      if (!mess || mess.status !== 'active') return res.status(404).send({ message: 'Mess not found.' })
+
+      const activeMembers = await messMemberCollections.countDocuments({ messId: mess._id, status: 'active' })
+      const actualAvailableSeats = Math.max(0, mess.maxMembers - activeMembers)
+
+      // Find the active manager of this mess
+      const managerMembership = await messMemberCollections.findOne(
+        { messId: mess._id, role: 'manager', status: 'active' },
+        { sort: { joinedAt: -1 } }
+      )
+      let manager = null
+      if (managerMembership) {
+        const managerUser = await userCollections.findOne({ _id: managerMembership.userId })
+        if (managerUser) {
+          manager = {
+            name: managerUser.name || '',
+            email: managerUser.email || '',
+            phone: managerUser.phone || '',
+            photoURL: managerUser.photoURL || '',
+          }
+        }
+      }
+
+      return res.send({
+        _id: post._id,
+        title: post.title,
+        description: post.description,
+        advertisedSeats: post.advertisedSeats,
+        messType: post.messType,
+        roomType: post.roomType,
+        foodSystem: post.foodSystem,
+        facilities: post.facilities,
+        approximateMonthlyCost: post.approximateMonthlyCost,
+        rent: post.rent,
+        additionalCost: post.additionalCost,
+        costNote: post.costNote,
+        images: post.images,
+        preferredMemberTypes: post.preferredMemberTypes,
+        additionalInformation: post.additionalInformation,
+        status: post.status,
+        createdAt: post.createdAt,
+        updatedAt: post.updatedAt,
+        mess: {
+          _id: mess._id,
+          name: mess.name,
+          description: mess.description,
+          location: {
+            address: mess.location?.address || '',
+            area: mess.location?.area || '',
+            city: mess.location?.city || '',
+            cityCorporation: mess.location?.cityCorporation || '',
+            latitude: mess.location?.latitude,
+            longitude: mess.location?.longitude,
+          },
+          maxMembers: mess.maxMembers,
+        },
+        activeMembers,
+        actualAvailableSeats,
+        manager,
       })
     })
 
