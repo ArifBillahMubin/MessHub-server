@@ -309,6 +309,71 @@ async function run() {
 
 
 
+    // PATCH /messes/:id — update basic mess information (manager only)
+    app.patch('/messes/:id', async (req, res) => {
+      const { ObjectId } = require('mongodb')
+      const { email, name, description, location, maxMembers } = req.body
+
+      if (!email) return res.status(400).send({ message: 'Email is required.' })
+
+      let messObjectId
+      try { messObjectId = new ObjectId(req.params.id) }
+      catch { return res.status(400).send({ message: 'Invalid mess ID.' }) }
+
+      // Verify the caller is the active manager of this mess
+      const caller = await userCollections.findOne({ email })
+      if (!caller) return res.status(404).send({ message: 'User not found.' })
+
+      const membership = await messMemberCollections.findOne({
+        userId: caller._id, messId: messObjectId, role: 'manager', status: 'active',
+      })
+      if (!membership) return res.status(403).send({ message: 'You are not the manager of this mess.' })
+
+      const mess = await messCollections.findOne({ _id: messObjectId })
+      if (!mess) return res.status(404).send({ message: 'Mess not found.' })
+
+      const updates = { updatedAt: new Date() }
+
+      if (name !== undefined) {
+        if (!name.trim()) return res.status(400).send({ message: 'Mess name cannot be empty.' })
+        updates.name = name.trim()
+      }
+      if (description !== undefined) updates.description = description?.trim() || ''
+
+      if (maxMembers !== undefined) {
+        const max = Number(maxMembers)
+        if (!max || max < 1) return res.status(400).send({ message: 'Maximum members must be a positive number.' })
+        // Cannot set maxMembers below current active member count
+        const activeCount = await messMemberCollections.countDocuments({ messId: messObjectId, status: 'active' })
+        if (max < activeCount) {
+          return res.status(400).send({
+            message: `Maximum members cannot be less than current active members (${activeCount}).`,
+          })
+        }
+        updates.maxMembers = max
+      }
+
+      if (location !== undefined) {
+        if (!location.address?.trim()) return res.status(400).send({ message: 'Location address is required.' })
+        if (location.latitude == null || location.longitude == null) {
+          return res.status(400).send({ message: 'Latitude and longitude are required.' })
+        }
+        updates.location = {
+          address:       location.address?.trim()       || mess.location?.address       || '',
+          area:          location.area?.trim()          || mess.location?.area          || '',
+          city:          location.city?.trim()          || mess.location?.city          || '',
+          cityCorporation: location.cityCorporation?.trim() || mess.location?.cityCorporation || '',
+          latitude:      Number(location.latitude),
+          longitude:     Number(location.longitude),
+        }
+      }
+
+      await messCollections.updateOne({ _id: messObjectId }, { $set: updates })
+
+      const updated = await messCollections.findOne({ _id: messObjectId })
+      return res.send({ success: true, mess: updated })
+    })
+
     // GET /users/my-mess — returns the mess document the current user is actively a member of
     app.get('/users/my-mess', async (req, res) => {
       const { email } = req.query
@@ -568,6 +633,7 @@ async function run() {
         {
           $project: {
             _id: 1,
+            userId: 1,
             role: 1,
             status: 1,
             joinedAt: 1,
@@ -1028,6 +1094,219 @@ async function run() {
         actualAvailableSeats,
         manager,
       })
+    })
+
+    // PATCH /messes/:id/regenerate-code — generate a new unique messCode for this mess
+    // Only the active manager of the mess may do this.
+    // Existing messMembers and joinRequests are unaffected; the old code simply stops matching.
+    app.patch('/messes/:id/regenerate-code', async (req, res) => {
+      const { ObjectId } = require('mongodb')
+      const { email } = req.body
+      if (!email) return res.status(400).send({ message: 'Email is required.' })
+
+      let messObjectId
+      try { messObjectId = new ObjectId(req.params.id) }
+      catch { return res.status(400).send({ message: 'Invalid mess ID.' }) }
+
+      const caller = await userCollections.findOne({ email })
+      if (!caller) return res.status(404).send({ message: 'User not found.' })
+
+      const membership = await messMemberCollections.findOne({
+        userId: caller._id, messId: messObjectId, role: 'manager', status: 'active',
+      })
+      if (!membership) return res.status(403).send({ message: 'You are not the manager of this mess.' })
+
+      try {
+        const newCode = await generateUniqueMessCode()
+        await messCollections.updateOne(
+          { _id: messObjectId },
+          { $set: { messCode: newCode, updatedAt: new Date() } }
+        )
+        return res.send({ success: true, messCode: newCode })
+      } catch (err) {
+        console.error('Error regenerating mess code:', err)
+        return res.status(500).send({ message: 'Could not generate a unique mess code. Please try again.' })
+      }
+    })
+
+    // ── Meals ─────────────────────────────────────────────────────────────────
+
+    const mealCollections = db.collection('meals')
+
+    // Unique index: one meal document per mess per day
+    try {
+      await mealCollections.createIndex({ messId: 1, date: 1 }, { unique: true })
+      console.log('Unique index on meals (messId, date) ensured.')
+    } catch (idxErr) {
+      console.warn('Could not create meals index (non-fatal):', idxErr.message)
+    }
+
+    // Normalise a date string to a UTC midnight Date for consistent storage and querying
+    const toMidnightUTC = (dateStr) => {
+      // dateStr expected as YYYY-MM-DD (Asia/Dhaka local date chosen by the manager)
+      const [y, m, d] = dateStr.split('-').map(Number)
+      return new Date(Date.UTC(y, m - 1, d))
+    }
+
+    const VALID_MEAL_VALUES = new Set([0, 0.5, 1])
+
+    // Helper function to validate guest meal values (multiples of 0.5)
+    const isValidGuestMeal = (val) => {
+      const num = Number(val)
+      if (isNaN(num) || num < 0) return false
+      // Check if it's a multiple of 0.5
+      return Math.abs((num * 2) % 1) < 0.001
+    }
+
+    // GET /meals/mess/:messId?month=YYYY-MM
+    app.get('/meals/mess/:messId', async (req, res) => {
+      const { ObjectId } = require('mongodb')
+      const { month } = req.query
+
+      if (!month || !/^\d{4}-\d{2}$/.test(month)) {
+        return res.status(400).send({ message: 'month query param is required (YYYY-MM).' })
+      }
+
+      let messObjectId
+      try { messObjectId = new ObjectId(req.params.messId) }
+      catch { return res.status(400).send({ message: 'Invalid mess ID.' }) }
+
+      const [year, mon] = month.split('-').map(Number)
+      const from = new Date(Date.UTC(year, mon - 1, 1))
+      const to   = new Date(Date.UTC(year, mon, 1))   // exclusive upper bound
+
+      const docs = await mealCollections
+        .find({ messId: messObjectId, date: { $gte: from, $lt: to } })
+        .sort({ date: 1 })
+        .toArray()
+
+      return res.send(docs)
+    })
+
+    // GET /meals/mess/:messId/date/:date  — date as YYYY-MM-DD
+    app.get('/meals/mess/:messId/date/:date', async (req, res) => {
+      const { ObjectId } = require('mongodb')
+
+      let messObjectId
+      try { messObjectId = new ObjectId(req.params.messId) }
+      catch { return res.status(400).send({ message: 'Invalid mess ID.' }) }
+
+      const dateStr = req.params.date
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(dateStr)) {
+        return res.status(400).send({ message: 'date must be YYYY-MM-DD.' })
+      }
+
+      const day = toMidnightUTC(dateStr)
+      const doc = await mealCollections.findOne({ messId: messObjectId, date: day })
+      return res.send({ meal: doc || null })
+    })
+
+    // PUT /meals/mess/:messId/date/:date  — create or replace the day's meal record
+    app.put('/meals/mess/:messId/date/:date', async (req, res) => {
+      const { ObjectId } = require('mongodb')
+      const { email, entries } = req.body
+
+      if (!email) return res.status(400).send({ message: 'email is required.' })
+      if (!Array.isArray(entries)) return res.status(400).send({ message: 'entries must be an array.' })
+
+      let messObjectId
+      try { messObjectId = new ObjectId(req.params.messId) }
+      catch { return res.status(400).send({ message: 'Invalid mess ID.' }) }
+
+      const dateStr = req.params.date
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(dateStr)) {
+        return res.status(400).send({ message: 'date must be YYYY-MM-DD.' })
+      }
+
+      // Validate date: must be current month, cannot be future
+      const [reqYear, reqMonth, reqDay] = dateStr.split('-').map(Number)
+      const now = new Date(new Date().toLocaleString('en-US', { timeZone: 'Asia/Dhaka' }))
+      const currentYear = now.getFullYear()
+      const currentMonth = now.getMonth() + 1  // 1-indexed
+      const currentDay = now.getDate()
+
+      // Reject if not current month
+      if (reqYear !== currentYear || reqMonth !== currentMonth) {
+        return res.status(400).send({ message: 'Meals can only be updated for the current month.' })
+      }
+
+      // Reject if future date
+      if (reqDay > currentDay) {
+        return res.status(400).send({ message: 'Future meal dates cannot be updated.' })
+      }
+
+      // Verify caller is active manager of this mess
+      const caller = await userCollections.findOne({ email })
+      if (!caller) return res.status(404).send({ message: 'User not found.' })
+
+      const managerMembership = await messMemberCollections.findOne({
+        userId: caller._id, messId: messObjectId, role: 'manager', status: 'active',
+      })
+      if (!managerMembership) {
+        return res.status(403).send({ message: 'You are not the manager of this mess.' })
+      }
+
+      // Load active members to validate submitted userIds
+      const activeMembers = await messMemberCollections
+        .find({ messId: messObjectId, status: 'active' })
+        .toArray()
+      const activeMemberIdSet = new Set(activeMembers.map(m => m.userId.toString()))
+
+      // Validate entries
+      for (const entry of entries) {
+        if (!entry.userId) return res.status(400).send({ message: 'Each entry must have userId.' })
+
+        let entryUserId
+        try { entryUserId = new ObjectId(entry.userId) }
+        catch { return res.status(400).send({ message: `Invalid userId: ${entry.userId}` }) }
+
+        if (!activeMemberIdSet.has(entryUserId.toString())) {
+          return res.status(400).send({ message: `userId ${entry.userId} is not an active member.` })
+        }
+
+        for (const slot of ['breakfast', 'lunch', 'dinner']) {
+          const val = Number(entry[slot] ?? 0)
+          if (!VALID_MEAL_VALUES.has(val)) {
+            return res.status(400).send({
+              message: `Invalid value ${entry[slot]} for ${slot}. Allowed: 0, 0.5, 1.`,
+            })
+          }
+        }
+
+        // Validate guestMeal - must be non-negative and multiple of 0.5
+        if (entry.guestMeal !== undefined) {
+          const guestMealVal = Number(entry.guestMeal ?? 0)
+          if (!isValidGuestMeal(guestMealVal)) {
+            return res.status(400).send({
+              message: `Invalid guestMeal value ${entry.guestMeal}. Must be non-negative and a multiple of 0.5.`,
+            })
+          }
+        }
+      }
+
+      // Build normalised entries — only store ObjectId userId + meal slot numbers
+      const cleanEntries = entries.map(e => ({
+        userId:    new ObjectId(e.userId),
+        breakfast: Number(e.breakfast ?? 0),
+        lunch:     Number(e.lunch     ?? 0),
+        dinner:    Number(e.dinner    ?? 0),
+        guestMeal: Number(e.guestMeal ?? 0),
+      }))
+
+      const day = toMidnightUTC(dateStr)
+      const timestamp = new Date()
+
+      await mealCollections.updateOne(
+        { messId: messObjectId, date: day },
+        {
+          $set:         { entries: cleanEntries, updatedAt: timestamp, messId: messObjectId, date: day },
+          $setOnInsert: { createdAt: timestamp },
+        },
+        { upsert: true }
+      )
+
+      const updated = await mealCollections.findOne({ messId: messObjectId, date: day })
+      return res.send({ success: true, meal: updated })
     })
 
     // Send a ping to confirm a successful connection
