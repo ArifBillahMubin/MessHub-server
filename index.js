@@ -62,6 +62,13 @@ async function run() {
     const messMemberCollections = db.collection('messMembers')
     const joinRequestCollections = db.collection('joinRequests')
     const messPostCollections = db.collection('messPosts')
+    const mealCollections = db.collection('meals')
+    const bazarCollections = db.collection('bazar')
+    const bazarAssignmentsCollections = db.collection('bazarAssignments')
+    const khalabillCollections = db.collection('khalabill')
+    const commonExpensesCollections = db.collection('commonExpenses')
+    const memberRentCollections = db.collection('memberRent')
+    const paymentsCollections = db.collection('payments')
 
 
 
@@ -1131,14 +1138,64 @@ async function run() {
 
     // ── Meals ─────────────────────────────────────────────────────────────────
 
-    const mealCollections = db.collection('meals')
-
     // Unique index: one meal document per mess per day
     try {
       await mealCollections.createIndex({ messId: 1, date: 1 }, { unique: true })
       console.log('Unique index on meals (messId, date) ensured.')
     } catch (idxErr) {
       console.warn('Could not create meals index (non-fatal):', idxErr.message)
+    }
+
+    // Bazar collection indexes
+    try {
+      await bazarCollections.createIndex({ messId: 1, date: -1 })
+      await bazarCollections.createIndex({ messId: 1, status: 1 })
+      console.log('Indexes on bazar collection ensured.')
+    } catch (idxErr) {
+      console.warn('Could not create bazar indexes (non-fatal):', idxErr.message)
+    }
+
+    // Bazar assignments collection indexes
+    try {
+      await bazarAssignmentsCollections.createIndex({ messId: 1, assignedTo: 1 })
+      await bazarAssignmentsCollections.createIndex({ messId: 1, status: 1 })
+      console.log('Indexes on bazarAssignments collection ensured.')
+    } catch (idxErr) {
+      console.warn('Could not create bazarAssignments indexes (non-fatal):', idxErr.message)
+    }
+
+    // Khalabill collection indexes
+    try {
+      await khalabillCollections.createIndex({ messId: 1, month: 1 }, { unique: true })
+      console.log('Indexes on khalabill collection ensured.')
+    } catch (idxErr) {
+      console.warn('Could not create khalabill indexes (non-fatal):', idxErr.message)
+    }
+
+    // Common expenses collection indexes
+    try {
+      await commonExpensesCollections.createIndex({ messId: 1, date: -1 })
+      console.log('Indexes on commonExpenses collection ensured.')
+    } catch (idxErr) {
+      console.warn('Could not create commonExpenses indexes (non-fatal):', idxErr.message)
+    }
+
+    // Member rent collection indexes
+    try {
+      await memberRentCollections.createIndex({ messId: 1, month: 1, userId: 1 }, { unique: true })
+      console.log('Indexes on memberRent collection ensured.')
+    } catch (idxErr) {
+      console.warn('Could not create memberRent indexes (non-fatal):', idxErr.message)
+    }
+
+    // Payments collection indexes
+    try {
+      await paymentsCollections.createIndex({ messId: 1, date: -1 })
+      await paymentsCollections.createIndex({ messId: 1, userId: 1 })
+      await paymentsCollections.createIndex({ messId: 1, category: 1 })
+      console.log('Indexes on payments collection ensured.')
+    } catch (idxErr) {
+      console.warn('Could not create payments indexes (non-fatal):', idxErr.message)
     }
 
     // Normalise a date string to a UTC midnight Date for consistent storage and querying
@@ -1307,6 +1364,1598 @@ async function run() {
 
       const updated = await mealCollections.findOne({ messId: messObjectId, date: day })
       return res.send({ success: true, meal: updated })
+    })
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    //  BAZAR MANAGEMENT API
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    // GET /bazar/mess/:messId — Get all bazar records for a mess (with optional status filter)
+    app.get('/bazar/mess/:messId', async (req, res) => {
+      const { ObjectId } = require('mongodb')
+      const { status, month } = req.query
+
+      let messObjectId
+      try { messObjectId = new ObjectId(req.params.messId) }
+      catch { return res.status(400).send({ message: 'Invalid mess ID.' }) }
+
+      const query = { messId: messObjectId }
+      
+      if (status) {
+        query.status = status
+      }
+
+      if (month && /^\d{4}-\d{2}$/.test(month)) {
+        const [year, mon] = month.split('-').map(Number)
+        const from = new Date(Date.UTC(year, mon - 1, 1))
+        const to = new Date(Date.UTC(year, mon, 1))
+        query.date = { $gte: from, $lt: to }
+      }
+
+      try {
+        const records = await bazarCollections
+          .find(query)
+          .sort({ date: -1 })
+          .toArray()
+
+        // Populate buyer information
+        for (const record of records) {
+          if (record.buyerId) {
+            const buyer = await userCollections.findOne(
+              { _id: record.buyerId },
+              { projection: { name: 1, email: 1, photoURL: 1 } }
+            )
+            record.buyer = buyer
+          }
+        }
+
+        return res.send({ records })
+      } catch (err) {
+        console.error(err)
+        return res.status(500).send({ message: 'Failed to fetch bazar records.' })
+      }
+    })
+
+    // POST /bazar/mess/:messId — Manager creates official bazar
+    app.post('/bazar/mess/:messId', async (req, res) => {
+      const { ObjectId } = require('mongodb')
+      const { email, date, buyerId, items, note, source } = req.body
+
+      if (!email) return res.status(400).send({ message: 'email is required.' })
+      if (!date) return res.status(400).send({ message: 'date is required.' })
+      if (!buyerId) return res.status(400).send({ message: 'buyerId is required.' })
+      if (!Array.isArray(items) || items.length === 0) {
+        return res.status(400).send({ message: 'items array is required.' })
+      }
+
+      let messObjectId, buyerObjectId
+      try { messObjectId = new ObjectId(req.params.messId) }
+      catch { return res.status(400).send({ message: 'Invalid mess ID.' }) }
+      try { buyerObjectId = new ObjectId(buyerId) }
+      catch { return res.status(400).send({ message: 'Invalid buyer ID.' }) }
+
+      // Verify caller is manager
+      const caller = await userCollections.findOne({ email })
+      if (!caller) return res.status(404).send({ message: 'User not found.' })
+
+      const managerMembership = await messMemberCollections.findOne({
+        userId: caller._id,
+        messId: messObjectId,
+        role: 'manager',
+        status: 'active',
+      })
+      if (!managerMembership) {
+        return res.status(403).send({ message: 'You are not the manager of this mess.' })
+      }
+
+      // Validate items
+      for (const item of items) {
+        if (!item.name?.trim()) {
+          return res.status(400).send({ message: 'Item name is required.' })
+        }
+        if (!item.quantity || item.quantity <= 0) {
+          return res.status(400).send({ message: 'Item quantity must be positive.' })
+        }
+        if (!item.amount || item.amount < 0) {
+          return res.status(400).send({ message: 'Item amount must be non-negative.' })
+        }
+      }
+
+      // Calculate total amount from items
+      const totalAmount = items.reduce((sum, item) => sum + Number(item.amount), 0)
+
+      const bazarDate = toMidnightUTC(date)
+      const now = new Date()
+
+      const newBazar = {
+        messId: messObjectId,
+        date: bazarDate,
+        buyerId: buyerObjectId,
+        source: source || 'manager',
+        assignmentId: null,
+        status: 'approved',
+        items: items.map(item => ({
+          name: item.name.trim(),
+          quantity: Number(item.quantity),
+          unit: item.unit?.trim() || '',
+          amount: Number(item.amount),
+        })),
+        totalAmount,
+        note: note?.trim() || '',
+        rejectionReason: '',
+        createdAt: now,
+        updatedAt: now,
+      }
+
+      try {
+        const result = await bazarCollections.insertOne(newBazar)
+        return res.send({ success: true, id: result.insertedId })
+      } catch (err) {
+        console.error(err)
+        return res.status(500).send({ message: 'Failed to create bazar.' })
+      }
+    })
+
+    // PUT /bazar/:id — Manager edits approved bazar
+    app.put('/bazar/:id', async (req, res) => {
+      const { ObjectId } = require('mongodb')
+      const { email, date, buyerId, items, note } = req.body
+
+      if (!email) return res.status(400).send({ message: 'email is required.' })
+
+      let bazarObjectId
+      try { bazarObjectId = new ObjectId(req.params.id) }
+      catch { return res.status(400).send({ message: 'Invalid bazar ID.' }) }
+
+      // Find existing bazar
+      const existing = await bazarCollections.findOne({ _id: bazarObjectId })
+      if (!existing) return res.status(404).send({ message: 'Bazar not found.' })
+
+      // Verify caller is manager
+      const caller = await userCollections.findOne({ email })
+      if (!caller) return res.status(404).send({ message: 'User not found.' })
+
+      const managerMembership = await messMemberCollections.findOne({
+        userId: caller._id,
+        messId: existing.messId,
+        role: 'manager',
+        status: 'active',
+      })
+      if (!managerMembership) {
+        return res.status(403).send({ message: 'You are not the manager of this mess.' })
+      }
+
+      // Build update
+      const update = { updatedAt: new Date() }
+
+      if (date) update.date = toMidnightUTC(date)
+      if (buyerId) {
+        try { update.buyerId = new ObjectId(buyerId) }
+        catch { return res.status(400).send({ message: 'Invalid buyer ID.' }) }
+      }
+      if (items && Array.isArray(items)) {
+        for (const item of items) {
+          if (!item.name?.trim()) {
+            return res.status(400).send({ message: 'Item name is required.' })
+          }
+          if (!item.quantity || item.quantity <= 0) {
+            return res.status(400).send({ message: 'Item quantity must be positive.' })
+          }
+          if (item.amount < 0) {
+            return res.status(400).send({ message: 'Item amount must be non-negative.' })
+          }
+        }
+        update.items = items.map(item => ({
+          name: item.name.trim(),
+          quantity: Number(item.quantity),
+          unit: item.unit?.trim() || '',
+          amount: Number(item.amount),
+        }))
+        update.totalAmount = items.reduce((sum, item) => sum + Number(item.amount), 0)
+      }
+      if (note !== undefined) update.note = note.trim()
+
+      try {
+        await bazarCollections.updateOne({ _id: bazarObjectId }, { $set: update })
+        return res.send({ success: true })
+      } catch (err) {
+        console.error(err)
+        return res.status(500).send({ message: 'Failed to update bazar.' })
+      }
+    })
+
+    // DELETE /bazar/:id — Manager deletes bazar
+    app.delete('/bazar/:id', async (req, res) => {
+      const { ObjectId } = require('mongodb')
+      const { email } = req.query
+
+      if (!email) return res.status(400).send({ message: 'email is required.' })
+
+      let bazarObjectId
+      try { bazarObjectId = new ObjectId(req.params.id) }
+      catch { return res.status(400).send({ message: 'Invalid bazar ID.' }) }
+
+      const existing = await bazarCollections.findOne({ _id: bazarObjectId })
+      if (!existing) return res.status(404).send({ message: 'Bazar not found.' })
+
+      // Verify caller is manager
+      const caller = await userCollections.findOne({ email })
+      if (!caller) return res.status(404).send({ message: 'User not found.' })
+
+      const managerMembership = await messMemberCollections.findOne({
+        userId: caller._id,
+        messId: existing.messId,
+        role: 'manager',
+        status: 'active',
+      })
+      if (!managerMembership) {
+        return res.status(403).send({ message: 'You are not the manager of this mess.' })
+      }
+
+      try {
+        await bazarCollections.deleteOne({ _id: bazarObjectId })
+        return res.send({ success: true })
+      } catch (err) {
+        console.error(err)
+        return res.status(500).send({ message: 'Failed to delete bazar.' })
+      }
+    })
+
+    // POST /bazar/mess/:messId/assign — Manager creates bazar assignment
+    app.post('/bazar/mess/:messId/assign', async (req, res) => {
+      const { ObjectId } = require('mongodb')
+      const { email, assignedTo, date, items, note } = req.body
+
+      if (!email) return res.status(400).send({ message: 'email is required.' })
+      if (!assignedTo) return res.status(400).send({ message: 'assignedTo is required.' })
+      if (!date) return res.status(400).send({ message: 'date is required.' })
+      if (!Array.isArray(items) || items.length === 0) {
+        return res.status(400).send({ message: 'items array is required.' })
+      }
+
+      let messObjectId, assignedToObjectId
+      try { messObjectId = new ObjectId(req.params.messId) }
+      catch { return res.status(400).send({ message: 'Invalid mess ID.' }) }
+      try { assignedToObjectId = new ObjectId(assignedTo) }
+      catch { return res.status(400).send({ message: 'Invalid assignedTo ID.' }) }
+
+      // Verify caller is manager
+      const caller = await userCollections.findOne({ email })
+      if (!caller) return res.status(404).send({ message: 'User not found.' })
+
+      const managerMembership = await messMemberCollections.findOne({
+        userId: caller._id,
+        messId: messObjectId,
+        role: 'manager',
+        status: 'active',
+      })
+      if (!managerMembership) {
+        return res.status(403).send({ message: 'You are not the manager of this mess.' })
+      }
+
+      // Verify assignedTo is active member
+      const memberMembership = await messMemberCollections.findOne({
+        userId: assignedToObjectId,
+        messId: messObjectId,
+        status: 'active',
+      })
+      if (!memberMembership) {
+        return res.status(400).send({ message: 'Assigned user is not an active member.' })
+      }
+
+      const assignmentDate = toMidnightUTC(date)
+      const now = new Date()
+
+      const newAssignment = {
+        messId: messObjectId,
+        assignedTo: assignedToObjectId,
+        assignedBy: caller._id,
+        date: assignmentDate,
+        items: items.map(item => ({
+          name: item.name?.trim() || '',
+          quantity: Number(item.quantity || 0),
+          unit: item.unit?.trim() || '',
+        })),
+        note: note?.trim() || '',
+        status: 'assigned',
+        createdAt: now,
+        updatedAt: now,
+      }
+
+      try {
+        const result = await bazarAssignmentsCollections.insertOne(newAssignment)
+        return res.send({ success: true, id: result.insertedId })
+      } catch (err) {
+        console.error(err)
+        return res.status(500).send({ message: 'Failed to create assignment.' })
+      }
+    })
+
+    // GET /bazar/assignments/mess/:messId — Get all assignments for a mess
+    app.get('/bazar/assignments/mess/:messId', async (req, res) => {
+      const { ObjectId } = require('mongodb')
+
+      let messObjectId
+      try { messObjectId = new ObjectId(req.params.messId) }
+      catch { return res.status(400).send({ message: 'Invalid mess ID.' }) }
+
+      try {
+        const assignments = await bazarAssignmentsCollections
+          .find({ messId: messObjectId })
+          .sort({ date: -1 })
+          .toArray()
+
+        // Populate assigned user and manager info
+        for (const assignment of assignments) {
+          if (assignment.assignedTo) {
+            const assignedUser = await userCollections.findOne(
+              { _id: assignment.assignedTo },
+              { projection: { name: 1, email: 1, photoURL: 1 } }
+            )
+            assignment.assignedUser = assignedUser
+          }
+          if (assignment.assignedBy) {
+            const manager = await userCollections.findOne(
+              { _id: assignment.assignedBy },
+              { projection: { name: 1, email: 1, photoURL: 1 } }
+            )
+            assignment.manager = manager
+          }
+        }
+
+        return res.send({ assignments })
+      } catch (err) {
+        console.error(err)
+        return res.status(500).send({ message: 'Failed to fetch assignments.' })
+      }
+    })
+
+    // GET /bazar/assignments/my — Get assignments for logged-in member
+    app.get('/bazar/assignments/my', async (req, res) => {
+      const { ObjectId } = require('mongodb')
+      const { email } = req.query
+
+      if (!email) return res.status(400).send({ message: 'email is required.' })
+
+      const caller = await userCollections.findOne({ email })
+      if (!caller) return res.status(404).send({ message: 'User not found.' })
+
+      try {
+        const assignments = await bazarAssignmentsCollections
+          .find({ assignedTo: caller._id })
+          .sort({ date: -1 })
+          .toArray()
+
+        // Populate manager info
+        for (const assignment of assignments) {
+          if (assignment.assignedBy) {
+            const manager = await userCollections.findOne(
+              { _id: assignment.assignedBy },
+              { projection: { name: 1, email: 1, photoURL: 1 } }
+            )
+            assignment.manager = manager
+          }
+        }
+
+        return res.send({ assignments })
+      } catch (err) {
+        console.error(err)
+        return res.status(500).send({ message: 'Failed to fetch assignments.' })
+      }
+    })
+
+    // PUT /bazar/assignments/:id — Manager updates assignment
+    app.put('/bazar/assignments/:id', async (req, res) => {
+      const { ObjectId } = require('mongodb')
+      const { email, assignedTo, date, items, note } = req.body
+
+      if (!email) return res.status(400).send({ message: 'email is required.' })
+
+      let assignmentObjectId
+      try { assignmentObjectId = new ObjectId(req.params.id) }
+      catch { return res.status(400).send({ message: 'Invalid assignment ID.' }) }
+
+      const existing = await bazarAssignmentsCollections.findOne({ _id: assignmentObjectId })
+      if (!existing) return res.status(404).send({ message: 'Assignment not found.' })
+
+      // Only allow modification if status is 'assigned'
+      if (existing.status !== 'assigned') {
+        return res.status(400).send({ message: 'Only assignments with "assigned" status can be modified.' })
+      }
+
+      // Verify caller is manager
+      const caller = await userCollections.findOne({ email })
+      if (!caller) return res.status(404).send({ message: 'User not found.' })
+
+      const managerMembership = await messMemberCollections.findOne({
+        userId: caller._id,
+        messId: existing.messId,
+        role: 'manager',
+        status: 'active',
+      })
+      if (!managerMembership) {
+        return res.status(403).send({ message: 'You are not the manager of this mess.' })
+      }
+
+      const update = { updatedAt: new Date() }
+
+      if (assignedTo) {
+        let assignedToObjectId
+        try { assignedToObjectId = new ObjectId(assignedTo) }
+        catch { return res.status(400).send({ message: 'Invalid assignedTo ID.' }) }
+        
+        // Verify new assignee is active member
+        const memberMembership = await messMemberCollections.findOne({
+          userId: assignedToObjectId,
+          messId: existing.messId,
+          status: 'active',
+        })
+        if (!memberMembership) {
+          return res.status(400).send({ message: 'Assigned user is not an active member.' })
+        }
+        update.assignedTo = assignedToObjectId
+      }
+
+      if (date) update.date = toMidnightUTC(date)
+      
+      if (items && Array.isArray(items)) {
+        update.items = items.map(item => ({
+          name: item.name?.trim() || '',
+          quantity: Number(item.quantity || 0),
+          unit: item.unit?.trim() || '',
+        }))
+      }
+
+      if (note !== undefined) update.note = note.trim()
+
+      try {
+        await bazarAssignmentsCollections.updateOne({ _id: assignmentObjectId }, { $set: update })
+        return res.send({ success: true })
+      } catch (err) {
+        console.error(err)
+        return res.status(500).send({ message: 'Failed to update assignment.' })
+      }
+    })
+
+    // PUT /bazar/assignments/:id/cancel — Manager cancels assignment
+    app.put('/bazar/assignments/:id/cancel', async (req, res) => {
+      const { ObjectId } = require('mongodb')
+      const { email } = req.body
+
+      if (!email) return res.status(400).send({ message: 'email is required.' })
+
+      let assignmentObjectId
+      try { assignmentObjectId = new ObjectId(req.params.id) }
+      catch { return res.status(400).send({ message: 'Invalid assignment ID.' }) }
+
+      const existing = await bazarAssignmentsCollections.findOne({ _id: assignmentObjectId })
+      if (!existing) return res.status(404).send({ message: 'Assignment not found.' })
+
+      // Verify caller is manager
+      const caller = await userCollections.findOne({ email })
+      if (!caller) return res.status(404).send({ message: 'User not found.' })
+
+      const managerMembership = await messMemberCollections.findOne({
+        userId: caller._id,
+        messId: existing.messId,
+        role: 'manager',
+        status: 'active',
+      })
+      if (!managerMembership) {
+        return res.status(403).send({ message: 'You are not the manager of this mess.' })
+      }
+
+      try {
+        await bazarAssignmentsCollections.updateOne(
+          { _id: assignmentObjectId },
+          { $set: { status: 'cancelled', updatedAt: new Date() } }
+        )
+        return res.send({ success: true })
+      } catch (err) {
+        console.error(err)
+        return res.status(500).send({ message: 'Failed to cancel assignment.' })
+      }
+    })
+
+    // DELETE /bazar/assignments/:id — Manager cancels assignment
+    app.delete('/bazar/assignments/:id', async (req, res) => {
+      const { ObjectId } = require('mongodb')
+      const { email } = req.query
+
+      if (!email) return res.status(400).send({ message: 'email is required.' })
+
+      let assignmentObjectId
+      try { assignmentObjectId = new ObjectId(req.params.id) }
+      catch { return res.status(400).send({ message: 'Invalid assignment ID.' }) }
+
+      const existing = await bazarAssignmentsCollections.findOne({ _id: assignmentObjectId })
+      if (!existing) return res.status(404).send({ message: 'Assignment not found.' })
+
+      // Verify caller is manager
+      const caller = await userCollections.findOne({ email })
+      if (!caller) return res.status(404).send({ message: 'User not found.' })
+
+      const managerMembership = await messMemberCollections.findOne({
+        userId: caller._id,
+        messId: existing.messId,
+        role: 'manager',
+        status: 'active',
+      })
+      if (!managerMembership) {
+        return res.status(403).send({ message: 'You are not the manager of this mess.' })
+      }
+
+      try {
+        await bazarAssignmentsCollections.deleteOne({ _id: assignmentObjectId })
+        return res.send({ success: true })
+      } catch (err) {
+        console.error(err)
+        return res.status(500).send({ message: 'Failed to delete assignment.' })
+      }
+    })
+
+    // POST /bazar/mess/:messId/submit — Member submits bazar (creates pending record)
+    app.post('/bazar/mess/:messId/submit', async (req, res) => {
+      const { ObjectId } = require('mongodb')
+      const { email, date, items, note, assignmentId } = req.body
+
+      if (!email) return res.status(400).send({ message: 'email is required.' })
+      if (!date) return res.status(400).send({ message: 'date is required.' })
+      if (!Array.isArray(items) || items.length === 0) {
+        return res.status(400).send({ message: 'items array is required.' })
+      }
+
+      let messObjectId
+      try { messObjectId = new ObjectId(req.params.messId) }
+      catch { return res.status(400).send({ message: 'Invalid mess ID.' }) }
+
+      // Verify caller is active member
+      const caller = await userCollections.findOne({ email })
+      if (!caller) return res.status(404).send({ message: 'User not found.' })
+
+      const membership = await messMemberCollections.findOne({
+        userId: caller._id,
+        messId: messObjectId,
+        status: 'active',
+      })
+      if (!membership) {
+        return res.status(403).send({ message: 'You are not an active member of this mess.' })
+      }
+
+      // Validate items
+      for (const item of items) {
+        if (!item.name?.trim()) {
+          return res.status(400).send({ message: 'Item name is required.' })
+        }
+        if (!item.quantity || item.quantity <= 0) {
+          return res.status(400).send({ message: 'Item quantity must be positive.' })
+        }
+        if (item.amount < 0) {
+          return res.status(400).send({ message: 'Item amount must be non-negative.' })
+        }
+      }
+
+      const totalAmount = items.reduce((sum, item) => sum + Number(item.amount), 0)
+      const bazarDate = toMidnightUTC(date)
+      const now = new Date()
+
+      const newBazar = {
+        messId: messObjectId,
+        date: bazarDate,
+        buyerId: caller._id,
+        source: assignmentId ? 'assigned' : 'member',
+        assignmentId: assignmentId ? new ObjectId(assignmentId) : null,
+        status: 'pending',
+        items: items.map(item => ({
+          name: item.name.trim(),
+          quantity: Number(item.quantity),
+          unit: item.unit?.trim() || '',
+          amount: Number(item.amount),
+        })),
+        totalAmount,
+        note: note?.trim() || '',
+        rejectionReason: '',
+        createdAt: now,
+        updatedAt: now,
+      }
+
+      try {
+        const result = await bazarCollections.insertOne(newBazar)
+        
+        // Update assignment status if applicable
+        if (assignmentId) {
+          await bazarAssignmentsCollections.updateOne(
+            { _id: new ObjectId(assignmentId) },
+            { $set: { status: 'submitted', updatedAt: now } }
+          )
+        }
+
+        return res.send({ success: true, id: result.insertedId })
+      } catch (err) {
+        console.error(err)
+        return res.status(500).send({ message: 'Failed to submit bazar.' })
+      }
+    })
+
+    // PUT /bazar/:id/approve — Manager approves pending bazar
+    app.put('/bazar/:id/approve', async (req, res) => {
+      const { ObjectId } = require('mongodb')
+      const { email } = req.body
+
+      if (!email) return res.status(400).send({ message: 'email is required.' })
+
+      let bazarObjectId
+      try { bazarObjectId = new ObjectId(req.params.id) }
+      catch { return res.status(400).send({ message: 'Invalid bazar ID.' }) }
+
+      const existing = await bazarCollections.findOne({ _id: bazarObjectId })
+      if (!existing) return res.status(404).send({ message: 'Bazar not found.' })
+
+      if (existing.status !== 'pending') {
+        return res.status(400).send({ message: 'Only pending bazar can be approved.' })
+      }
+
+      // Verify caller is manager
+      const caller = await userCollections.findOne({ email })
+      if (!caller) return res.status(404).send({ message: 'User not found.' })
+
+      const managerMembership = await messMemberCollections.findOne({
+        userId: caller._id,
+        messId: existing.messId,
+        role: 'manager',
+        status: 'active',
+      })
+      if (!managerMembership) {
+        return res.status(403).send({ message: 'You are not the manager of this mess.' })
+      }
+
+      try {
+        await bazarCollections.updateOne(
+          { _id: bazarObjectId },
+          { $set: { status: 'approved', updatedAt: new Date() } }
+        )
+        return res.send({ success: true })
+      } catch (err) {
+        console.error(err)
+        return res.status(500).send({ message: 'Failed to approve bazar.' })
+      }
+    })
+
+    // PUT /bazar/:id/reject — Manager rejects pending bazar
+    app.put('/bazar/:id/reject', async (req, res) => {
+      const { ObjectId } = require('mongodb')
+      const { email, reason } = req.body
+
+      if (!email) return res.status(400).send({ message: 'email is required.' })
+
+      let bazarObjectId
+      try { bazarObjectId = new ObjectId(req.params.id) }
+      catch { return res.status(400).send({ message: 'Invalid bazar ID.' }) }
+
+      const existing = await bazarCollections.findOne({ _id: bazarObjectId })
+      if (!existing) return res.status(404).send({ message: 'Bazar not found.' })
+
+      if (existing.status !== 'pending') {
+        return res.status(400).send({ message: 'Only pending bazar can be rejected.' })
+      }
+
+      // Verify caller is manager
+      const caller = await userCollections.findOne({ email })
+      if (!caller) return res.status(404).send({ message: 'User not found.' })
+
+      const managerMembership = await messMemberCollections.findOne({
+        userId: caller._id,
+        messId: existing.messId,
+        role: 'manager',
+        status: 'active',
+      })
+      if (!managerMembership) {
+        return res.status(403).send({ message: 'You are not the manager of this mess.' })
+      }
+
+      try {
+        await bazarCollections.updateOne(
+          { _id: bazarObjectId },
+          { 
+            $set: { 
+              status: 'rejected', 
+              rejectionReason: reason?.trim() || 'No reason provided',
+              updatedAt: new Date() 
+            } 
+          }
+        )
+        return res.send({ success: true })
+      } catch (err) {
+        console.error(err)
+        return res.status(500).send({ message: 'Failed to reject bazar.' })
+      }
+    })
+
+    // GET /bazar/my-history — Member gets own bazar history
+    app.get('/bazar/my-history', async (req, res) => {
+      const { ObjectId } = require('mongodb')
+      const { email, messId } = req.query
+
+      if (!email) return res.status(400).send({ message: 'email is required.' })
+      if (!messId) return res.status(400).send({ message: 'messId is required.' })
+
+      let messObjectId
+      try { messObjectId = new ObjectId(messId) }
+      catch { return res.status(400).send({ message: 'Invalid mess ID.' }) }
+
+      const caller = await userCollections.findOne({ email })
+      if (!caller) return res.status(404).send({ message: 'User not found.' })
+
+      try {
+        const records = await bazarCollections
+          .find({ 
+            messId: messObjectId,
+            buyerId: caller._id
+          })
+          .sort({ date: -1 })
+          .toArray()
+
+        return res.send({ records })
+      } catch (err) {
+        console.error(err)
+        return res.status(500).send({ message: 'Failed to fetch history.' })
+      }
+    })
+
+    // ========================================
+    // EXPENSES MANAGEMENT APIs
+    // ========================================
+
+    // GET /expenses/khalabill/:messId — Get current month khalabill
+    app.get('/expenses/khalabill/:messId', async (req, res) => {
+      const { ObjectId } = require('mongodb')
+      const { email } = req.query
+
+      if (!email) return res.status(400).send({ message: 'email is required.' })
+
+      let messObjectId
+      try { messObjectId = new ObjectId(req.params.messId) }
+      catch { return res.status(400).send({ message: 'Invalid mess ID.' }) }
+
+      const caller = await userCollections.findOne({ email })
+      if (!caller) return res.status(404).send({ message: 'User not found.' })
+
+      const membership = await messMemberCollections.findOne({
+        userId: caller._id,
+        messId: messObjectId,
+        status: 'active',
+      })
+      if (!membership) {
+        return res.status(403).send({ message: 'You are not a member of this mess.' })
+      }
+
+      // Get current month in YYYY-MM format (Asia/Dhaka)
+      const now = new Date(new Date().toLocaleString('en-US', { timeZone: 'Asia/Dhaka' }))
+      const currentMonth = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}`
+
+      try {
+        const khalabill = await khalabillCollections.findOne({
+          messId: messObjectId,
+          month: currentMonth
+        })
+
+        // Get active member count
+        const activeMemberCount = await messMemberCollections.countDocuments({
+          messId: messObjectId,
+          status: 'active'
+        })
+
+        return res.send({
+          khalabill: khalabill || null,
+          activeMemberCount,
+          perMember: khalabill && activeMemberCount > 0 
+            ? khalabill.amount / activeMemberCount 
+            : 0
+        })
+      } catch (err) {
+        console.error(err)
+        return res.status(500).send({ message: 'Failed to fetch khalabill.' })
+      }
+    })
+
+    // POST /expenses/khalabill/:messId — Create/update khalabill
+    app.post('/expenses/khalabill/:messId', async (req, res) => {
+      const { ObjectId } = require('mongodb')
+      const { email, amount, note } = req.body
+
+      if (!email) return res.status(400).send({ message: 'email is required.' })
+      if (amount === undefined || amount === null) {
+        return res.status(400).send({ message: 'amount is required.' })
+      }
+
+      const numAmount = Number(amount)
+      if (isNaN(numAmount) || numAmount < 0) {
+        return res.status(400).send({ message: 'amount must be a valid non-negative number.' })
+      }
+
+      let messObjectId
+      try { messObjectId = new ObjectId(req.params.messId) }
+      catch { return res.status(400).send({ message: 'Invalid mess ID.' }) }
+
+      const caller = await userCollections.findOne({ email })
+      if (!caller) return res.status(404).send({ message: 'User not found.' })
+
+      // Verify caller is manager
+      const managerMembership = await messMemberCollections.findOne({
+        userId: caller._id,
+        messId: messObjectId,
+        role: 'manager',
+        status: 'active',
+      })
+      if (!managerMembership) {
+        return res.status(403).send({ message: 'Only managers can set khalabill.' })
+      }
+
+      // Get current month
+      const now = new Date(new Date().toLocaleString('en-US', { timeZone: 'Asia/Dhaka' }))
+      const currentMonth = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}`
+
+      try {
+        const result = await khalabillCollections.updateOne(
+          { messId: messObjectId, month: currentMonth },
+          {
+            $set: {
+              amount: numAmount,
+              note: note?.trim() || '',
+              updatedBy: caller._id,
+              updatedAt: new Date()
+            },
+            $setOnInsert: {
+              messId: messObjectId,
+              month: currentMonth,
+              createdBy: caller._id,
+              createdAt: new Date()
+            }
+          },
+          { upsert: true }
+        )
+        return res.send({ success: true, upsertedId: result.upsertedId })
+      } catch (err) {
+        console.error(err)
+        return res.status(500).send({ message: 'Failed to save khalabill.' })
+      }
+    })
+
+    // GET /expenses/common/:messId — Get current month common expenses
+    app.get('/expenses/common/:messId', async (req, res) => {
+      const { ObjectId } = require('mongodb')
+      const { email } = req.query
+
+      if (!email) return res.status(400).send({ message: 'email is required.' })
+
+      let messObjectId
+      try { messObjectId = new ObjectId(req.params.messId) }
+      catch { return res.status(400).send({ message: 'Invalid mess ID.' }) }
+
+      const caller = await userCollections.findOne({ email })
+      if (!caller) return res.status(404).send({ message: 'User not found.' })
+
+      const membership = await messMemberCollections.findOne({
+        userId: caller._id,
+        messId: messObjectId,
+        status: 'active',
+      })
+      if (!membership) {
+        return res.status(403).send({ message: 'You are not a member of this mess.' })
+      }
+
+      // Get current month date range
+      const now = new Date(new Date().toLocaleString('en-US', { timeZone: 'Asia/Dhaka' }))
+      const year = now.getFullYear()
+      const month = now.getMonth()
+      const startDate = new Date(Date.UTC(year, month, 1))
+      const endDate = new Date(Date.UTC(year, month + 1, 0, 23, 59, 59, 999))
+
+      try {
+        const expenses = await commonExpensesCollections
+          .find({
+            messId: messObjectId,
+            date: { $gte: startDate, $lte: endDate }
+          })
+          .sort({ date: -1 })
+          .toArray()
+
+        // Populate creator info
+        const expensesWithCreator = await Promise.all(
+          expenses.map(async (exp) => {
+            const creator = await userCollections.findOne(
+              { _id: exp.createdBy },
+              { projection: { name: 1, email: 1, photoURL: 1 } }
+            )
+            return { ...exp, creator }
+          })
+        )
+
+        const total = expenses.reduce((sum, exp) => sum + exp.amount, 0)
+
+        return res.send({ expenses: expensesWithCreator, total })
+      } catch (err) {
+        console.error(err)
+        return res.status(500).send({ message: 'Failed to fetch expenses.' })
+      }
+    })
+
+    // GET /expenses/common/single/:id — Get single expense details
+    app.get('/expenses/common/single/:id', async (req, res) => {
+      const { ObjectId } = require('mongodb')
+      const { email } = req.query
+
+      if (!email) return res.status(400).send({ message: 'email is required.' })
+
+      let expenseObjectId
+      try { expenseObjectId = new ObjectId(req.params.id) }
+      catch { return res.status(400).send({ message: 'Invalid expense ID.' }) }
+
+      const expense = await commonExpensesCollections.findOne({ _id: expenseObjectId })
+      if (!expense) return res.status(404).send({ message: 'Expense not found.' })
+
+      const caller = await userCollections.findOne({ email })
+      if (!caller) return res.status(404).send({ message: 'User not found.' })
+
+      const membership = await messMemberCollections.findOne({
+        userId: caller._id,
+        messId: expense.messId,
+        status: 'active',
+      })
+      if (!membership) {
+        return res.status(403).send({ message: 'You are not a member of this mess.' })
+      }
+
+      // Populate creator info
+      const creator = await userCollections.findOne(
+        { _id: expense.createdBy },
+        { projection: { name: 1, email: 1, photoURL: 1 } }
+      )
+
+      return res.send({ expense: { ...expense, creator } })
+    })
+
+    // POST /expenses/common/:messId — Create common expense
+    app.post('/expenses/common/:messId', async (req, res) => {
+      const { ObjectId } = require('mongodb')
+      const { email, date, category, amount, note } = req.body
+
+      if (!email) return res.status(400).send({ message: 'email is required.' })
+      if (!date) return res.status(400).send({ message: 'date is required.' })
+      if (!category) return res.status(400).send({ message: 'category is required.' })
+      if (amount === undefined || amount === null) {
+        return res.status(400).send({ message: 'amount is required.' })
+      }
+
+      const numAmount = Number(amount)
+      if (isNaN(numAmount) || numAmount <= 0) {
+        return res.status(400).send({ message: 'amount must be a positive number.' })
+      }
+
+      let messObjectId
+      try { messObjectId = new ObjectId(req.params.messId) }
+      catch { return res.status(400).send({ message: 'Invalid mess ID.' }) }
+
+      const caller = await userCollections.findOne({ email })
+      if (!caller) return res.status(404).send({ message: 'User not found.' })
+
+      // Verify caller is manager
+      const managerMembership = await messMemberCollections.findOne({
+        userId: caller._id,
+        messId: messObjectId,
+        role: 'manager',
+        status: 'active',
+      })
+      if (!managerMembership) {
+        return res.status(403).send({ message: 'Only managers can add expenses.' })
+      }
+
+      // Validate date is current month
+      const [reqYear, reqMonth, reqDay] = date.split('-').map(Number)
+      const now = new Date(new Date().toLocaleString('en-US', { timeZone: 'Asia/Dhaka' }))
+      const currentYear = now.getFullYear()
+      const currentMonth = now.getMonth() + 1
+
+      if (reqYear !== currentYear || reqMonth !== currentMonth) {
+        return res.status(400).send({ message: 'Expenses can only be added for the current month.' })
+      }
+
+      try {
+        const expenseDoc = {
+          messId: messObjectId,
+          date: toMidnightUTC(date),
+          category: category.trim(),
+          amount: numAmount,
+          note: note?.trim() || '',
+          createdBy: caller._id,
+          createdAt: new Date(),
+          updatedAt: new Date()
+        }
+
+        const result = await commonExpensesCollections.insertOne(expenseDoc)
+        return res.send({ success: true, insertedId: result.insertedId })
+      } catch (err) {
+        console.error(err)
+        return res.status(500).send({ message: 'Failed to create expense.' })
+      }
+    })
+
+    // PUT /expenses/common/:id — Update common expense
+    app.put('/expenses/common/:id', async (req, res) => {
+      const { ObjectId } = require('mongodb')
+      const { email, date, category, amount, note } = req.body
+
+      if (!email) return res.status(400).send({ message: 'email is required.' })
+
+      let expenseObjectId
+      try { expenseObjectId = new ObjectId(req.params.id) }
+      catch { return res.status(400).send({ message: 'Invalid expense ID.' }) }
+
+      const existing = await commonExpensesCollections.findOne({ _id: expenseObjectId })
+      if (!existing) return res.status(404).send({ message: 'Expense not found.' })
+
+      const caller = await userCollections.findOne({ email })
+      if (!caller) return res.status(404).send({ message: 'User not found.' })
+
+      // Verify caller is manager
+      const managerMembership = await messMemberCollections.findOne({
+        userId: caller._id,
+        messId: existing.messId,
+        role: 'manager',
+        status: 'active',
+      })
+      if (!managerMembership) {
+        return res.status(403).send({ message: 'Only managers can edit expenses.' })
+      }
+
+      const updates = { updatedAt: new Date() }
+
+      if (date !== undefined) {
+        // Validate date is current month
+        const [reqYear, reqMonth, reqDay] = date.split('-').map(Number)
+        const now = new Date(new Date().toLocaleString('en-US', { timeZone: 'Asia/Dhaka' }))
+        const currentYear = now.getFullYear()
+        const currentMonth = now.getMonth() + 1
+
+        if (reqYear !== currentYear || reqMonth !== currentMonth) {
+          return res.status(400).send({ message: 'Expenses can only be set for the current month.' })
+        }
+        updates.date = toMidnightUTC(date)
+      }
+
+      if (category !== undefined) updates.category = category.trim()
+      
+      if (amount !== undefined) {
+        const numAmount = Number(amount)
+        if (isNaN(numAmount) || numAmount <= 0) {
+          return res.status(400).send({ message: 'amount must be a positive number.' })
+        }
+        updates.amount = numAmount
+      }
+
+      if (note !== undefined) updates.note = note.trim()
+
+      try {
+        await commonExpensesCollections.updateOne(
+          { _id: expenseObjectId },
+          { $set: updates }
+        )
+        return res.send({ success: true })
+      } catch (err) {
+        console.error(err)
+        return res.status(500).send({ message: 'Failed to update expense.' })
+      }
+    })
+
+    // DELETE /expenses/common/:id — Delete common expense
+    app.delete('/expenses/common/:id', async (req, res) => {
+      const { ObjectId } = require('mongodb')
+      const { email } = req.query
+
+      if (!email) return res.status(400).send({ message: 'email is required.' })
+
+      let expenseObjectId
+      try { expenseObjectId = new ObjectId(req.params.id) }
+      catch { return res.status(400).send({ message: 'Invalid expense ID.' }) }
+
+      const existing = await commonExpensesCollections.findOne({ _id: expenseObjectId })
+      if (!existing) return res.status(404).send({ message: 'Expense not found.' })
+
+      const caller = await userCollections.findOne({ email })
+      if (!caller) return res.status(404).send({ message: 'User not found.' })
+
+      // Verify caller is manager
+      const managerMembership = await messMemberCollections.findOne({
+        userId: caller._id,
+        messId: existing.messId,
+        role: 'manager',
+        status: 'active',
+      })
+      if (!managerMembership) {
+        return res.status(403).send({ message: 'Only managers can delete expenses.' })
+      }
+
+      try {
+        await commonExpensesCollections.deleteOne({ _id: expenseObjectId })
+        return res.send({ success: true })
+      } catch (err) {
+        console.error(err)
+        return res.status(500).send({ message: 'Failed to delete expense.' })
+      }
+    })
+
+    // GET /expenses/rent/:messId — Get current month member rents
+    app.get('/expenses/rent/:messId', async (req, res) => {
+      const { ObjectId } = require('mongodb')
+      const { email } = req.query
+
+      if (!email) return res.status(400).send({ message: 'email is required.' })
+
+      let messObjectId
+      try { messObjectId = new ObjectId(req.params.messId) }
+      catch { return res.status(400).send({ message: 'Invalid mess ID.' }) }
+
+      const caller = await userCollections.findOne({ email })
+      if (!caller) return res.status(404).send({ message: 'User not found.' })
+
+      const membership = await messMemberCollections.findOne({
+        userId: caller._id,
+        messId: messObjectId,
+        status: 'active',
+      })
+      if (!membership) {
+        return res.status(403).send({ message: 'You are not a member of this mess.' })
+      }
+
+      // Get current month
+      const now = new Date(new Date().toLocaleString('en-US', { timeZone: 'Asia/Dhaka' }))
+      const currentMonth = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}`
+
+      try {
+        // Get all active members
+        const activeMembers = await messMemberCollections
+          .find({ messId: messObjectId, status: 'active' })
+          .toArray()
+
+        // Get all rents for current month
+        const rents = await memberRentCollections
+          .find({ messId: messObjectId, month: currentMonth })
+          .toArray()
+
+        // Populate member info and merge with rent data
+        const membersWithRent = await Promise.all(
+          activeMembers.map(async (member) => {
+            const user = await userCollections.findOne(
+              { _id: member.userId },
+              { projection: { name: 1, email: 1, photoURL: 1 } }
+            )
+            const rent = rents.find(r => r.userId.equals(member.userId))
+            return {
+              userId: member.userId,
+              user,
+              role: member.role,
+              rent: rent ? rent.amount : null,
+              rentId: rent ? rent._id : null,
+              lastUpdated: rent ? rent.updatedAt : null
+            }
+          })
+        )
+
+        const totalRent = rents.reduce((sum, r) => sum + r.amount, 0)
+
+        return res.send({ members: membersWithRent, totalRent })
+      } catch (err) {
+        console.error(err)
+        return res.status(500).send({ message: 'Failed to fetch member rents.' })
+      }
+    })
+
+    // POST /expenses/rent/:messId — Set/update member rent
+    app.post('/expenses/rent/:messId', async (req, res) => {
+      const { ObjectId } = require('mongodb')
+      const { email, userId, amount } = req.body
+
+      if (!email) return res.status(400).send({ message: 'email is required.' })
+      if (!userId) return res.status(400).send({ message: 'userId is required.' })
+      if (amount === undefined || amount === null) {
+        return res.status(400).send({ message: 'amount is required.' })
+      }
+
+      const numAmount = Number(amount)
+      if (isNaN(numAmount) || numAmount < 0) {
+        return res.status(400).send({ message: 'amount must be a non-negative number.' })
+      }
+
+      let messObjectId, userObjectId
+      try { 
+        messObjectId = new ObjectId(req.params.messId)
+        userObjectId = new ObjectId(userId)
+      }
+      catch { return res.status(400).send({ message: 'Invalid ID.' }) }
+
+      const caller = await userCollections.findOne({ email })
+      if (!caller) return res.status(404).send({ message: 'User not found.' })
+
+      // Verify caller is manager
+      const managerMembership = await messMemberCollections.findOne({
+        userId: caller._id,
+        messId: messObjectId,
+        role: 'manager',
+        status: 'active',
+      })
+      if (!managerMembership) {
+        return res.status(403).send({ message: 'Only managers can set rent.' })
+      }
+
+      // Verify target user is active member
+      const targetMembership = await messMemberCollections.findOne({
+        userId: userObjectId,
+        messId: messObjectId,
+        status: 'active'
+      })
+      if (!targetMembership) {
+        return res.status(400).send({ message: 'User is not an active member of this mess.' })
+      }
+
+      // Get current month
+      const now = new Date(new Date().toLocaleString('en-US', { timeZone: 'Asia/Dhaka' }))
+      const currentMonth = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}`
+
+      try {
+        const result = await memberRentCollections.updateOne(
+          { messId: messObjectId, month: currentMonth, userId: userObjectId },
+          {
+            $set: {
+              amount: numAmount,
+              updatedBy: caller._id,
+              updatedAt: new Date()
+            },
+            $setOnInsert: {
+              messId: messObjectId,
+              month: currentMonth,
+              userId: userObjectId,
+              createdAt: new Date()
+            }
+          },
+          { upsert: true }
+        )
+        return res.send({ success: true, upsertedId: result.upsertedId })
+      } catch (err) {
+        console.error(err)
+        return res.status(500).send({ message: 'Failed to set rent.' })
+      }
+    })
+
+    // ========================================
+    // PAYMENTS MANAGEMENT APIs
+    // ========================================
+
+    // GET /payments/:messId — Get current month payments
+    app.get('/payments/:messId', async (req, res) => {
+      const { ObjectId } = require('mongodb')
+      const { email } = req.query
+
+      if (!email) return res.status(400).send({ message: 'email is required.' })
+
+      let messObjectId
+      try { messObjectId = new ObjectId(req.params.messId) }
+      catch { return res.status(400).send({ message: 'Invalid mess ID.' }) }
+
+      const caller = await userCollections.findOne({ email })
+      if (!caller) return res.status(404).send({ message: 'User not found.' })
+
+      const membership = await messMemberCollections.findOne({
+        userId: caller._id,
+        messId: messObjectId,
+        status: 'active',
+      })
+      if (!membership) {
+        return res.status(403).send({ message: 'You are not a member of this mess.' })
+      }
+
+      // Get current month date range
+      const now = new Date(new Date().toLocaleString('en-US', { timeZone: 'Asia/Dhaka' }))
+      const year = now.getFullYear()
+      const month = now.getMonth()
+      const startDate = new Date(Date.UTC(year, month, 1))
+      const endDate = new Date(Date.UTC(year, month + 1, 0, 23, 59, 59, 999))
+
+      try {
+        const payments = await paymentsCollections
+          .find({
+            messId: messObjectId,
+            date: { $gte: startDate, $lte: endDate }
+          })
+          .sort({ date: -1 })
+          .toArray()
+
+        // Populate member and creator info
+        const paymentsWithInfo = await Promise.all(
+          payments.map(async (payment) => {
+            const member = await userCollections.findOne(
+              { _id: payment.userId },
+              { projection: { name: 1, email: 1, photoURL: 1 } }
+            )
+            const creator = await userCollections.findOne(
+              { _id: payment.createdBy },
+              { projection: { name: 1, email: 1 } }
+            )
+            return { ...payment, member, creator }
+          })
+        )
+
+        // Calculate category-wise totals
+        const totals = {
+          meal: 0,
+          rent: 0,
+          khalabill: 0,
+          common_expense: 0,
+          other: 0,
+          total: 0
+        }
+
+        payments.forEach(p => {
+          totals[p.category] = (totals[p.category] || 0) + p.amount
+          totals.total += p.amount
+        })
+
+        return res.send({ payments: paymentsWithInfo, totals, count: payments.length })
+      } catch (err) {
+        console.error(err)
+        return res.status(500).send({ message: 'Failed to fetch payments.' })
+      }
+    })
+
+    // GET /payments/single/:id — Get single payment details
+    app.get('/payments/single/:id', async (req, res) => {
+      const { ObjectId } = require('mongodb')
+      const { email } = req.query
+
+      if (!email) return res.status(400).send({ message: 'email is required.' })
+
+      let paymentObjectId
+      try { paymentObjectId = new ObjectId(req.params.id) }
+      catch { return res.status(400).send({ message: 'Invalid payment ID.' }) }
+
+      const payment = await paymentsCollections.findOne({ _id: paymentObjectId })
+      if (!payment) return res.status(404).send({ message: 'Payment not found.' })
+
+      const caller = await userCollections.findOne({ email })
+      if (!caller) return res.status(404).send({ message: 'User not found.' })
+
+      const membership = await messMemberCollections.findOne({
+        userId: caller._id,
+        messId: payment.messId,
+        status: 'active',
+      })
+      if (!membership) {
+        return res.status(403).send({ message: 'You are not a member of this mess.' })
+      }
+
+      // Populate member and creator info
+      const member = await userCollections.findOne(
+        { _id: payment.userId },
+        { projection: { name: 1, email: 1, photoURL: 1 } }
+      )
+      const creator = await userCollections.findOne(
+        { _id: payment.createdBy },
+        { projection: { name: 1, email: 1 } }
+      )
+
+      return res.send({ payment: { ...payment, member, creator } })
+    })
+
+    // POST /payments/:messId — Create payment
+    app.post('/payments/:messId', async (req, res) => {
+      const { ObjectId } = require('mongodb')
+      const { email, userId, category, amount, date, note } = req.body
+
+      if (!email) return res.status(400).send({ message: 'email is required.' })
+      if (!userId) return res.status(400).send({ message: 'userId is required.' })
+      if (!category) return res.status(400).send({ message: 'category is required.' })
+      if (amount === undefined || amount === null) {
+        return res.status(400).send({ message: 'amount is required.' })
+      }
+      if (!date) return res.status(400).send({ message: 'date is required.' })
+
+      const numAmount = Number(amount)
+      if (isNaN(numAmount) || numAmount <= 0) {
+        return res.status(400).send({ message: 'amount must be a positive number.' })
+      }
+
+      // Validate category
+      const validCategories = ['meal', 'rent', 'khalabill', 'common_expense', 'other']
+      if (!validCategories.includes(category)) {
+        return res.status(400).send({ message: 'Invalid category.' })
+      }
+
+      let messObjectId, userObjectId
+      try { 
+        messObjectId = new ObjectId(req.params.messId)
+        userObjectId = new ObjectId(userId)
+      }
+      catch { return res.status(400).send({ message: 'Invalid ID.' }) }
+
+      const caller = await userCollections.findOne({ email })
+      if (!caller) return res.status(404).send({ message: 'User not found.' })
+
+      // Verify caller is manager
+      const managerMembership = await messMemberCollections.findOne({
+        userId: caller._id,
+        messId: messObjectId,
+        role: 'manager',
+        status: 'active',
+      })
+      if (!managerMembership) {
+        return res.status(403).send({ message: 'Only managers can record payments.' })
+      }
+
+      // Verify payment recipient is active member
+      const recipientMembership = await messMemberCollections.findOne({
+        userId: userObjectId,
+        messId: messObjectId,
+        status: 'active'
+      })
+      if (!recipientMembership) {
+        return res.status(400).send({ message: 'Payment recipient is not an active member of this mess.' })
+      }
+
+      // Validate date is current month
+      const [reqYear, reqMonth, reqDay] = date.split('-').map(Number)
+      const now = new Date(new Date().toLocaleString('en-US', { timeZone: 'Asia/Dhaka' }))
+      const currentYear = now.getFullYear()
+      const currentMonth = now.getMonth() + 1
+
+      if (reqYear !== currentYear || reqMonth !== currentMonth) {
+        return res.status(400).send({ message: 'Payments can only be recorded for the current month.' })
+      }
+
+      try {
+        const paymentDoc = {
+          messId: messObjectId,
+          userId: userObjectId,
+          category,
+          amount: numAmount,
+          date: toMidnightUTC(date),
+          note: note?.trim() || '',
+          createdBy: caller._id,
+          createdAt: new Date(),
+          updatedAt: new Date()
+        }
+
+        const result = await paymentsCollections.insertOne(paymentDoc)
+        return res.send({ success: true, insertedId: result.insertedId })
+      } catch (err) {
+        console.error(err)
+        return res.status(500).send({ message: 'Failed to create payment.' })
+      }
+    })
+
+    // PUT /payments/:id — Update payment
+    app.put('/payments/:id', async (req, res) => {
+      const { ObjectId } = require('mongodb')
+      const { email, userId, category, amount, date, note } = req.body
+
+      if (!email) return res.status(400).send({ message: 'email is required.' })
+
+      let paymentObjectId
+      try { paymentObjectId = new ObjectId(req.params.id) }
+      catch { return res.status(400).send({ message: 'Invalid payment ID.' }) }
+
+      const existing = await paymentsCollections.findOne({ _id: paymentObjectId })
+      if (!existing) return res.status(404).send({ message: 'Payment not found.' })
+
+      const caller = await userCollections.findOne({ email })
+      if (!caller) return res.status(404).send({ message: 'User not found.' })
+
+      // Verify caller is manager
+      const managerMembership = await messMemberCollections.findOne({
+        userId: caller._id,
+        messId: existing.messId,
+        role: 'manager',
+        status: 'active',
+      })
+      if (!managerMembership) {
+        return res.status(403).send({ message: 'Only managers can edit payments.' })
+      }
+
+      const updates = { updatedAt: new Date() }
+
+      if (userId !== undefined) {
+        let userObjectId
+        try { userObjectId = new ObjectId(userId) }
+        catch { return res.status(400).send({ message: 'Invalid user ID.' }) }
+
+        // Verify new user is active member
+        const recipientMembership = await messMemberCollections.findOne({
+          userId: userObjectId,
+          messId: existing.messId,
+          status: 'active'
+        })
+        if (!recipientMembership) {
+          return res.status(400).send({ message: 'Payment recipient is not an active member of this mess.' })
+        }
+        updates.userId = userObjectId
+      }
+
+      if (category !== undefined) {
+        const validCategories = ['meal', 'rent', 'khalabill', 'common_expense', 'other']
+        if (!validCategories.includes(category)) {
+          return res.status(400).send({ message: 'Invalid category.' })
+        }
+        updates.category = category
+      }
+
+      if (amount !== undefined) {
+        const numAmount = Number(amount)
+        if (isNaN(numAmount) || numAmount <= 0) {
+          return res.status(400).send({ message: 'amount must be a positive number.' })
+        }
+        updates.amount = numAmount
+      }
+
+      if (date !== undefined) {
+        // Validate date is current month
+        const [reqYear, reqMonth, reqDay] = date.split('-').map(Number)
+        const now = new Date(new Date().toLocaleString('en-US', { timeZone: 'Asia/Dhaka' }))
+        const currentYear = now.getFullYear()
+        const currentMonth = now.getMonth() + 1
+
+        if (reqYear !== currentYear || reqMonth !== currentMonth) {
+          return res.status(400).send({ message: 'Payments can only be set for the current month.' })
+        }
+        updates.date = toMidnightUTC(date)
+      }
+
+      if (note !== undefined) updates.note = note.trim()
+
+      try {
+        await paymentsCollections.updateOne(
+          { _id: paymentObjectId },
+          { $set: updates }
+        )
+        return res.send({ success: true })
+      } catch (err) {
+        console.error(err)
+        return res.status(500).send({ message: 'Failed to update payment.' })
+      }
+    })
+
+    // DELETE /payments/:id — Delete payment
+    app.delete('/payments/:id', async (req, res) => {
+      const { ObjectId } = require('mongodb')
+      const { email } = req.query
+
+      if (!email) return res.status(400).send({ message: 'email is required.' })
+
+      let paymentObjectId
+      try { paymentObjectId = new ObjectId(req.params.id) }
+      catch { return res.status(400).send({ message: 'Invalid payment ID.' }) }
+
+      const existing = await paymentsCollections.findOne({ _id: paymentObjectId })
+      if (!existing) return res.status(404).send({ message: 'Payment not found.' })
+
+      const caller = await userCollections.findOne({ email })
+      if (!caller) return res.status(404).send({ message: 'User not found.' })
+
+      // Verify caller is manager
+      const managerMembership = await messMemberCollections.findOne({
+        userId: caller._id,
+        messId: existing.messId,
+        role: 'manager',
+        status: 'active',
+      })
+      if (!managerMembership) {
+        return res.status(403).send({ message: 'Only managers can delete payments.' })
+      }
+
+      try {
+        await paymentsCollections.deleteOne({ _id: paymentObjectId })
+        return res.send({ success: true })
+      } catch (err) {
+        console.error(err)
+        return res.status(500).send({ message: 'Failed to delete payment.' })
+      }
     })
 
     // Send a ping to confirm a successful connection
