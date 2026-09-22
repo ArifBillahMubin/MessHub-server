@@ -2958,6 +2958,279 @@ async function run() {
       }
     })
 
+    // ========================================
+    // CALCULATIONS & SETTLEMENT API
+    // ========================================
+
+    // GET /calculations/:messId — Get current month calculations and settlement
+    app.get('/calculations/:messId', async (req, res) => {
+      const { ObjectId } = require('mongodb')
+      const { email } = req.query
+
+      if (!email) return res.status(400).send({ message: 'email is required.' })
+
+      let messObjectId
+      try { messObjectId = new ObjectId(req.params.messId) }
+      catch { return res.status(400).send({ message: 'Invalid mess ID.' }) }
+
+      const caller = await userCollections.findOne({ email })
+      if (!caller) return res.status(404).send({ message: 'User not found.' })
+
+      const membership = await messMemberCollections.findOne({
+        userId: caller._id,
+        messId: messObjectId,
+        status: 'active',
+      })
+      if (!membership) {
+        return res.status(403).send({ message: 'You are not a member of this mess.' })
+      }
+
+      // Get current month
+      const now = new Date(new Date().toLocaleString('en-US', { timeZone: 'Asia/Dhaka' }))
+      const year = now.getFullYear()
+      const month = now.getMonth()
+      const monthStr = `${year}-${String(month + 1).padStart(2, '0')}`
+      const startDate = new Date(Date.UTC(year, month, 1))
+      const endDate = new Date(Date.UTC(year, month + 1, 1)) // Exclusive upper bound
+
+      try {
+        // Get active members
+        const activeMembers = await messMemberCollections
+          .find({ messId: messObjectId, status: 'active' })
+          .toArray()
+        
+        const memberIds = activeMembers.map(m => m.userId)
+        
+        // Populate member user info
+        const memberUsers = await userCollections
+          .find({ _id: { $in: memberIds } })
+          .project({ name: 1, email: 1, photoURL: 1 })
+          .toArray()
+        
+        const memberMap = {}
+        memberUsers.forEach(u => {
+          memberMap[u._id.toString()] = u
+        })
+
+        // Get approved bazar total
+        const approvedBazar = await bazarCollections
+          .find({
+            messId: messObjectId,
+            date: { $gte: startDate, $lt: endDate },
+            status: 'approved'
+          })
+          .toArray()
+        
+        const totalBazarCost = approvedBazar.reduce((sum, b) => sum + b.totalAmount, 0)
+
+        // Get meal documents for current month
+        const mealDocs = await mealCollections
+          .find({
+            messId: messObjectId,
+            date: { $gte: startDate, $lt: endDate }
+          })
+          .toArray()
+
+        // Calculate total meals and member-wise meals from entries array
+        let totalMeals = 0
+        const memberMeals = {}
+        
+        // Initialize meals for all active members
+        memberIds.forEach(id => {
+          memberMeals[id.toString()] = {
+            breakfast: 0,
+            lunch: 0,
+            dinner: 0,
+            guestMeal: 0,
+            total: 0
+          }
+        })
+
+        // Aggregate meals from all daily documents
+        mealDocs.forEach(doc => {
+          if (doc.entries && Array.isArray(doc.entries)) {
+            doc.entries.forEach(entry => {
+              const key = entry.userId.toString()
+              // Only count meals for active members
+              if (memberMeals[key]) {
+                const breakfast = Number(entry.breakfast || 0)
+                const lunch = Number(entry.lunch || 0)
+                const dinner = Number(entry.dinner || 0)
+                const guestMeal = Number(entry.guestMeal || 0)
+                
+                memberMeals[key].breakfast += breakfast
+                memberMeals[key].lunch += lunch
+                memberMeals[key].dinner += dinner
+                memberMeals[key].guestMeal += guestMeal
+                memberMeals[key].total += breakfast + lunch + dinner + guestMeal
+              }
+            })
+          }
+        })
+
+        // Calculate total meals across all members
+        Object.values(memberMeals).forEach(m => {
+          totalMeals += m.total
+        })
+
+        const mealRate = totalMeals > 0 ? totalBazarCost / totalMeals : 0
+
+        // Get khalabill
+        const khalabill = await khalabillCollections.findOne({
+          messId: messObjectId,
+          month: monthStr
+        })
+        
+        const totalKhalabill = khalabill?.amount || 0
+        const perMemberKhalabill = activeMembers.length > 0 ? totalKhalabill / activeMembers.length : 0
+
+        // Get common expenses
+        const commonExpenses = await commonExpensesCollections
+          .find({
+            messId: messObjectId,
+            date: { $gte: startDate, $lt: endDate }
+          })
+          .toArray()
+        
+        const totalCommonExpense = commonExpenses.reduce((sum, e) => sum + e.amount, 0)
+        const perMemberCommonExpense = activeMembers.length > 0 ? totalCommonExpense / activeMembers.length : 0
+
+        // Get member rents
+        const rents = await memberRentCollections
+          .find({
+            messId: messObjectId,
+            month: monthStr
+          })
+          .toArray()
+        
+        const memberRents = {}
+        let totalRent = 0
+        rents.forEach(r => {
+          memberRents[r.userId.toString()] = r.amount
+          totalRent += r.amount
+        })
+
+        // Get payments
+        const payments = await paymentsCollections
+          .find({
+            messId: messObjectId,
+            date: { $gte: startDate, $lt: endDate }
+          })
+          .toArray()
+
+        // Calculate member-wise payments
+        const memberPayments = {}
+        const memberPaymentsByCategory = {}
+        const memberPaymentDetails = {}
+        
+        memberIds.forEach(id => {
+          const key = id.toString()
+          memberPayments[key] = 0
+          memberPaymentsByCategory[key] = {
+            meal: 0,
+            rent: 0,
+            khalabill: 0,
+            common_expense: 0,
+            other: 0
+          }
+          memberPaymentDetails[key] = []
+        })
+
+        payments.forEach(p => {
+          const key = p.userId.toString()
+          if (memberPayments[key] !== undefined) {
+            memberPayments[key] += p.amount
+            if (memberPaymentsByCategory[key][p.category] !== undefined) {
+              memberPaymentsByCategory[key][p.category] += p.amount
+            }
+            memberPaymentDetails[key].push({
+              category: p.category,
+              amount: p.amount,
+              note: p.note,
+              date: p.date
+            })
+          }
+        })
+
+        const totalPaid = payments.reduce((sum, p) => sum + p.amount, 0)
+
+        // Calculate member settlement
+        const memberSettlement = memberIds.map(userId => {
+          const key = userId.toString()
+          const user = memberMap[key]
+          const foodCost = (memberMeals[key]?.total || 0) * mealRate
+          const rent = memberRents[key] || 0
+          const khalabill = perMemberKhalabill
+          const commonExpense = perMemberCommonExpense
+          const totalCost = foodCost + rent + khalabill + commonExpense
+          const paid = memberPayments[key] || 0
+          const balance = totalCost - paid
+          
+          let status = 'Settled'
+          if (balance > 0.01) status = 'Due'
+          else if (balance < -0.01) status = 'Advance'
+
+          return {
+            userId: userId.toString(),
+            user,
+            meals: memberMeals[key],
+            foodCost,
+            rent,
+            khalabill,
+            commonExpense,
+            totalCost,
+            paid,
+            paymentsByCategory: memberPaymentsByCategory[key],
+            payments: memberPaymentDetails[key],
+            balance,
+            status
+          }
+        })
+
+        // Calculate totals
+        let totalDue = 0
+        let totalAdvance = 0
+        memberSettlement.forEach(m => {
+          if (m.status === 'Due') totalDue += m.balance
+          else if (m.status === 'Advance') totalAdvance += Math.abs(m.balance)
+        })
+
+        const totalCost = totalBazarCost + totalRent + totalKhalabill + totalCommonExpense
+
+        return res.send({
+          summary: {
+            totalCost,
+            totalPaid,
+            totalDue,
+            totalAdvance
+          },
+          mealCalculation: {
+            totalBazarCost,
+            totalMeals,
+            mealRate
+          },
+          rentCalculation: {
+            totalRent,
+            activeMembers: activeMembers.length
+          },
+          khalabillCalculation: {
+            totalKhalabill,
+            activeMembers: activeMembers.length,
+            perMember: perMemberKhalabill
+          },
+          commonExpenseCalculation: {
+            totalCommonExpense,
+            activeMembers: activeMembers.length,
+            perMember: perMemberCommonExpense
+          },
+          memberSettlement
+        })
+      } catch (err) {
+        console.error(err)
+        return res.status(500).send({ message: 'Failed to calculate settlement.' })
+      }
+    })
+
     // Send a ping to confirm a successful connection
     await client.db('admin').command({ ping: 1 })
     console.log(
