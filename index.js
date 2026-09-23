@@ -15,6 +15,8 @@ admin.initializeApp({
   credential: admin.credential.cert(serviceAccount),
 })
 
+const chatbotRoutes = require('./chatbot/routes')
+
 const app = express()
 // middleware
 app.use(
@@ -3245,6 +3247,8 @@ run().catch(console.dir)
 app.get('/', (req, res) => {
   res.send('Hello from Server..')
 })
+
+app.use('/chatbot', chatbotRoutes)
 
 app.listen(port, () => {
   console.log(`Server is running on port ${port}`)
