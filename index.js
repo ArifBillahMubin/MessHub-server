@@ -69,6 +69,8 @@ async function run() {
     const commonExpensesCollections = db.collection('commonExpenses')
     const memberRentCollections = db.collection('memberRent')
     const paymentsCollections = db.collection('payments')
+    const notificationsCollections = db.collection('notifications')
+    const monthlyReportsCollections = db.collection('monthlyReports')
 
 
 
@@ -88,6 +90,15 @@ async function run() {
       console.log('Unique index on messCode ensured.')
     } catch (indexErr) {
       console.warn('Could not create messCode index (non-fatal):', indexErr.message)
+    }
+
+    // Notification indexes for efficient queries
+    try {
+      await notificationsCollections.createIndex({ userId: 1, messId: 1, isRead: 1, createdAt: -1 })
+      await notificationsCollections.createIndex({ messId: 1, createdAt: -1 })
+      console.log('Notification indexes ensured.')
+    } catch (indexErr) {
+      console.warn('Could not create notification indexes (non-fatal):', indexErr.message)
     }
 
     //  Mess Code Generator 
@@ -312,6 +323,61 @@ async function run() {
       res.send(user)
     })
 
+    // PATCH /users/me — update current user profile (editable fields only)
+    app.patch('/users/me', async (req, res) => {
+      const { email, name, photoURL, phone, location, bio } = req.body
+
+      if (!email) return res.status(400).send({ message: 'Email is required.' })
+
+      try {
+        // Find the current user by email
+        const user = await userCollections.findOne({ email })
+        if (!user) return res.status(404).send({ message: 'User not found.' })
+
+        // Build update object with only allowed fields
+        const updates = { updatedAt: new Date() }
+
+        if (name !== undefined) {
+          const trimmedName = name?.trim()
+          if (!trimmedName) return res.status(400).send({ message: 'Name cannot be empty.' })
+          updates.name = trimmedName
+        }
+
+        if (photoURL !== undefined) {
+          updates.photoURL = photoURL?.trim() || ''
+        }
+
+        if (phone !== undefined) {
+          updates.phone = phone?.trim() || ''
+        }
+
+        if (location !== undefined) {
+          updates.location = location?.trim() || ''
+        }
+
+        if (bio !== undefined) {
+          updates.bio = bio?.trim() || ''
+        }
+
+        // Update the user document
+        const result = await userCollections.updateOne(
+          { email },
+          { $set: updates }
+        )
+
+        if (result.modifiedCount === 0) {
+          return res.status(304).send({ message: 'No changes made.' })
+        }
+
+        // Return updated user
+        const updatedUser = await userCollections.findOne({ email })
+        res.send({ message: 'Profile updated successfully.', user: updatedUser })
+      } catch (err) {
+        console.error('Failed to update user profile:', err)
+        res.status(500).send({ message: 'Failed to update profile.' })
+      }
+    })
+
 
 
 
@@ -468,6 +534,26 @@ async function run() {
       }
 
       const result = await joinRequestCollections.insertOne(joinRequest)
+      
+      console.log('[Join Request] Created successfully, now checking for manager to notify')
+      
+      // Notify manager about new join request
+      const manager = await messMemberCollections.findOne({ messId: mess._id, role: 'manager', status: 'active' })
+      
+      if (manager) {
+        console.log('[Join Request] Manager found:', manager.userId?.toString())
+        await createNotification({
+          userId: manager.userId,
+          messId: mess._id,
+          type: 'join_request',
+          title: 'New Join Request',
+          message: `${joinRequest.name || 'A user'} has requested to join your mess.`,
+          link: '/dashboard/mess/join-requests'
+        })
+      } else {
+        console.log('[Join Request] No manager found for mess:', mess._id?.toString())
+      }
+
       return res.status(201).send({ success: true, requestId: result.insertedId })
     })
 
@@ -566,6 +652,43 @@ async function run() {
         { $set: { hasMess: true, updatedAt: now } }
       )
 
+      console.log('[Join Request Approval] Creating approval notification for user:', joinReq.userId?.toString())
+
+      // Create notification for approved member
+      await createNotification({
+        userId: joinReq.userId,
+        messId: joinReq.messId,
+        type: 'join_request_approved',
+        title: 'Join Request Approved',
+        message: `Your request to join ${mess.messName} has been approved.`,
+        link: '/dashboard'
+      })
+
+      // NOTIFICATION: capacity_warning → notify manager if mess is nearing full capacity (90%+)
+      const newActiveCount = activeCount + 1
+      const capacityPercent = (newActiveCount / mess.maxMembers) * 100
+
+      if (capacityPercent >= 90) {
+        // Get manager
+        const manager = await messMemberCollections.findOne({
+          messId: joinReq.messId,
+          role: 'manager',
+          status: 'active'
+        })
+
+        if (manager) {
+          await createNotification({
+            userId: manager.userId,
+            messId: joinReq.messId,
+            type: 'capacity_warning',
+            title: 'Capacity Warning',
+            message: `Your mess is at ${capacityPercent.toFixed(0)}% capacity (${newActiveCount}/${mess.maxMembers} members).`,
+            link: '/dashboard/members'
+          })
+          console.log(`[NOTIFICATION] capacity_warning created for manager ${manager.userId} - ${newActiveCount}/${mess.maxMembers}`)
+        }
+      }
+
       return res.send({ success: true, message: 'Request approved.' })
     })
 
@@ -580,10 +703,24 @@ async function run() {
       if (!joinReq) return res.status(404).send({ message: 'Join request not found.' })
       if (joinReq.status !== 'pending') return res.status(400).send({ message: 'Request is no longer pending.' })
 
+      const mess = await messCollections.findOne({ _id: joinReq.messId })
+
       await joinRequestCollections.updateOne(
         { _id: reqObjectId },
         { $set: { status: 'rejected', updatedAt: new Date() } }
       )
+
+      // Create notification for rejected member
+      if (mess) {
+        await createNotification({
+          userId: joinReq.userId,
+          messId: joinReq.messId,
+          type: 'join_request_rejected',
+          title: 'Join Request Rejected',
+          message: `Your request to join ${mess.messName} was not approved.`,
+          link: '/dashboard/join-mess'
+        })
+      }
 
       return res.send({ success: true, message: 'Request rejected.' })
     })
@@ -1198,6 +1335,15 @@ async function run() {
       console.warn('Could not create payments indexes (non-fatal):', idxErr.message)
     }
 
+    // Monthly reports collection indexes
+    try {
+      await monthlyReportsCollections.createIndex({ messId: 1, month: 1 }, { unique: true })
+      await monthlyReportsCollections.createIndex({ messId: 1, closedAt: -1 })
+      console.log('Indexes on monthlyReports collection ensured.')
+    } catch (idxErr) {
+      console.warn('Could not create monthlyReports indexes (non-fatal):', idxErr.message)
+    }
+
     // Normalise a date string to a UTC midnight Date for consistent storage and querying
     const toMidnightUTC = (dateStr) => {
       // dateStr expected as YYYY-MM-DD (Asia/Dhaka local date chosen by the manager)
@@ -1303,6 +1449,16 @@ async function run() {
         return res.status(403).send({ message: 'You are not the manager of this mess.' })
       }
 
+      // Check if month is closed
+      const monthStr = `${reqYear}-${String(reqMonth).padStart(2, '0')}`
+      const closedMonth = await monthlyReportsCollections.findOne({
+        messId: messObjectId,
+        month: monthStr
+      })
+      if (closedMonth) {
+        return res.status(400).send({ message: 'This month is already closed and cannot be modified.' })
+      }
+
       // Load active members to validate submitted userIds
       const activeMembers = await messMemberCollections
         .find({ messId: messObjectId, status: 'active' })
@@ -1361,6 +1517,23 @@ async function run() {
         },
         { upsert: true }
       )
+
+      // Notify affected members about meal update
+      const displayDateStr = day.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' })
+      for (const entry of cleanEntries) {
+        // Only notify if there's actual meal data (not all zeros)
+        const hasMealData = entry.breakfast > 0 || entry.lunch > 0 || entry.dinner > 0 || entry.guestMeal > 0
+        if (hasMealData) {
+          await createNotification({
+            userId: entry.userId,
+            messId: messObjectId,
+            type: 'meal_updated',
+            title: 'Meal Updated',
+            message: `Your meal for ${displayDateStr} has been updated.`,
+            link: '/dashboard/my-meals'
+          })
+        }
+      }
 
       const updated = await mealCollections.findOne({ messId: messObjectId, date: day })
       return res.send({ success: true, meal: updated })
@@ -1643,7 +1816,18 @@ async function run() {
         return res.status(400).send({ message: 'Assigned user is not an active member.' })
       }
 
+      // Check if month is closed
       const assignmentDate = toMidnightUTC(date)
+      const dateObj = new Date(assignmentDate)
+      const monthStr = `${dateObj.getUTCFullYear()}-${String(dateObj.getUTCMonth() + 1).padStart(2, '0')}`
+      const closedMonth = await monthlyReportsCollections.findOne({
+        messId: messObjectId,
+        month: monthStr
+      })
+      if (closedMonth) {
+        return res.status(400).send({ message: 'This month is already closed and cannot be modified.' })
+      }
+
       const now = new Date()
 
       const newAssignment = {
@@ -1664,6 +1848,19 @@ async function run() {
 
       try {
         const result = await bazarAssignmentsCollections.insertOne(newAssignment)
+        
+        // Notify assigned member
+        const assignedUser = await userCollections.findOne({ _id: assignedToObjectId })
+        const dateStr = assignmentDate.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' })
+        await createNotification({
+          userId: assignedToObjectId,
+          messId: messObjectId,
+          type: 'bazar_assignment',
+          title: 'New Bazar Assignment',
+          message: `You have been assigned bazar for ${dateStr}.`,
+          link: '/dashboard/my-bazar'
+        })
+        
         return res.send({ success: true, id: result.insertedId })
       } catch (err) {
         console.error(err)
@@ -1922,6 +2119,18 @@ async function run() {
         return res.status(403).send({ message: 'You are not an active member of this mess.' })
       }
 
+      // Check if month is closed
+      const bazarDate = toMidnightUTC(date)
+      const dateObj = new Date(bazarDate)
+      const monthStr = `${dateObj.getUTCFullYear()}-${String(dateObj.getUTCMonth() + 1).padStart(2, '0')}`
+      const closedMonth = await monthlyReportsCollections.findOne({
+        messId: messObjectId,
+        month: monthStr
+      })
+      if (closedMonth) {
+        return res.status(400).send({ message: 'This month is already closed and cannot be modified.' })
+      }
+
       // Validate items
       for (const item of items) {
         if (!item.name?.trim()) {
@@ -1936,7 +2145,6 @@ async function run() {
       }
 
       const totalAmount = items.reduce((sum, item) => sum + Number(item.amount), 0)
-      const bazarDate = toMidnightUTC(date)
       const now = new Date()
 
       const newBazar = {
@@ -1968,6 +2176,21 @@ async function run() {
             { _id: new ObjectId(assignmentId) },
             { $set: { status: 'submitted', updatedAt: now } }
           )
+        }
+
+        // Notify manager about bazar submission
+        const manager = await messMemberCollections.findOne({ messId: messObjectId, role: 'manager', status: 'active' })
+        if (manager) {
+          const mess = await messCollections.findOne({ _id: messObjectId })
+          const dateStr = bazarDate.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' })
+          await createNotification({
+            userId: manager.userId,
+            messId: messObjectId,
+            type: 'bazar_submitted',
+            title: 'Bazar Submitted',
+            message: `${caller.name || 'A member'} submitted bazar for ${dateStr}.`,
+            link: '/dashboard/monthly/bazar'
+          })
         }
 
         return res.send({ success: true, id: result.insertedId })
@@ -2009,11 +2232,33 @@ async function run() {
         return res.status(403).send({ message: 'You are not the manager of this mess.' })
       }
 
+      // Check if month is closed
+      const dateObj = new Date(existing.date)
+      const monthStr = `${dateObj.getUTCFullYear()}-${String(dateObj.getUTCMonth() + 1).padStart(2, '0')}`
+      const closedMonth = await monthlyReportsCollections.findOne({
+        messId: existing.messId,
+        month: monthStr
+      })
+      if (closedMonth) {
+        return res.status(400).send({ message: 'This month is already closed and cannot be modified.' })
+      }
+
       try {
         await bazarCollections.updateOne(
           { _id: bazarObjectId },
           { $set: { status: 'approved', updatedAt: new Date() } }
         )
+        
+        // Notify member about approval
+        await createNotification({
+          userId: existing.buyerId,
+          messId: existing.messId,
+          type: 'bazar_approved',
+          title: 'Bazar Approved',
+          message: 'Your bazar submission has been approved by the manager.',
+          link: '/dashboard/my-bazar'
+        })
+
         return res.send({ success: true })
       } catch (err) {
         console.error(err)
@@ -2053,6 +2298,17 @@ async function run() {
         return res.status(403).send({ message: 'You are not the manager of this mess.' })
       }
 
+      // Check if month is closed
+      const dateObj = new Date(existing.date)
+      const monthStr = `${dateObj.getUTCFullYear()}-${String(dateObj.getUTCMonth() + 1).padStart(2, '0')}`
+      const closedMonth = await monthlyReportsCollections.findOne({
+        messId: existing.messId,
+        month: monthStr
+      })
+      if (closedMonth) {
+        return res.status(400).send({ message: 'This month is already closed and cannot be modified.' })
+      }
+
       try {
         await bazarCollections.updateOne(
           { _id: bazarObjectId },
@@ -2064,6 +2320,18 @@ async function run() {
             } 
           }
         )
+        
+        // Notify member about rejection
+        const rejectionMsg = reason?.trim() ? `Reason: ${reason.trim()}` : 'Your bazar submission was rejected by the manager.'
+        await createNotification({
+          userId: existing.buyerId,
+          messId: existing.messId,
+          type: 'bazar_rejected',
+          title: 'Bazar Rejected',
+          message: rejectionMsg,
+          link: '/dashboard/my-bazar'
+        })
+
         return res.send({ success: true })
       } catch (err) {
         console.error(err)
@@ -2194,6 +2462,15 @@ async function run() {
       // Get current month
       const now = new Date(new Date().toLocaleString('en-US', { timeZone: 'Asia/Dhaka' }))
       const currentMonth = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}`
+
+      // Check if month is closed
+      const closedMonth = await monthlyReportsCollections.findOne({
+        messId: messObjectId,
+        month: currentMonth
+      })
+      if (closedMonth) {
+        return res.status(400).send({ message: 'This month is already closed and cannot be modified.' })
+      }
 
       try {
         const result = await khalabillCollections.updateOne(
@@ -2358,6 +2635,16 @@ async function run() {
 
       if (reqYear !== currentYear || reqMonth !== currentMonth) {
         return res.status(400).send({ message: 'Expenses can only be added for the current month.' })
+      }
+
+      // Check if month is closed
+      const monthStr = `${reqYear}-${String(reqMonth).padStart(2, '0')}`
+      const closedMonth = await monthlyReportsCollections.findOne({
+        messId: messObjectId,
+        month: monthStr
+      })
+      if (closedMonth) {
+        return res.status(400).send({ message: 'This month is already closed and cannot be modified.' })
       }
 
       try {
@@ -2601,6 +2888,15 @@ async function run() {
       const now = new Date(new Date().toLocaleString('en-US', { timeZone: 'Asia/Dhaka' }))
       const currentMonth = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}`
 
+      // Check if month is closed
+      const closedMonth = await monthlyReportsCollections.findOne({
+        messId: messObjectId,
+        month: currentMonth
+      })
+      if (closedMonth) {
+        return res.status(400).send({ message: 'This month is already closed and cannot be modified.' })
+      }
+
       try {
         const result = await memberRentCollections.updateOne(
           { messId: messObjectId, month: currentMonth, userId: userObjectId },
@@ -2810,6 +3106,16 @@ async function run() {
         return res.status(400).send({ message: 'Payments can only be recorded for the current month.' })
       }
 
+      // Check if month is closed
+      const monthStr = `${reqYear}-${String(reqMonth).padStart(2, '0')}`
+      const closedMonth = await monthlyReportsCollections.findOne({
+        messId: messObjectId,
+        month: monthStr
+      })
+      if (closedMonth) {
+        return res.status(400).send({ message: 'This month is already closed and cannot be modified.' })
+      }
+
       try {
         const paymentDoc = {
           messId: messObjectId,
@@ -2824,6 +3130,19 @@ async function run() {
         }
 
         const result = await paymentsCollections.insertOne(paymentDoc)
+        
+        // Notify member about payment recorded
+        const recipient = await userCollections.findOne({ _id: userObjectId })
+        const categoryLabel = category.replace('_', ' ').replace(/\b\w/g, l => l.toUpperCase())
+        await createNotification({
+          userId: userObjectId,
+          messId: messObjectId,
+          type: 'payment_recorded',
+          title: 'Payment Recorded',
+          message: `Your payment of ৳${numAmount.toLocaleString('en-BD', {minimumFractionDigits: 2})} for ${categoryLabel} has been recorded.`,
+          link: '/dashboard/monthly/report'
+        })
+
         return res.send({ success: true, insertedId: result.insertedId })
       } catch (err) {
         console.error(err)
@@ -2909,11 +3228,44 @@ async function run() {
 
       if (note !== undefined) updates.note = note.trim()
 
+      // Check if month is closed
+      const paymentDate = updates.date || existing.date
+      const dateObj = new Date(paymentDate)
+      const monthStr = `${dateObj.getUTCFullYear()}-${String(dateObj.getUTCMonth() + 1).padStart(2, '0')}`
+      const closedMonth = await monthlyReportsCollections.findOne({
+        messId: existing.messId,
+        month: monthStr
+      })
+      if (closedMonth) {
+        return res.status(400).send({ message: 'This month is already closed and cannot be modified.' })
+      }
+
       try {
         await paymentsCollections.updateOne(
           { _id: paymentObjectId },
           { $set: updates }
         )
+
+        // NOTIFICATION: payment_updated → notify the affected member
+        const affectedUserId = updates.userId || existing.userId
+        const affectedMember = await messMemberCollections.findOne({
+          userId: affectedUserId,
+          messId: existing.messId,
+          status: 'active'
+        })
+
+        if (affectedMember) {
+          await createNotification({
+            userId: affectedMember.userId,
+            messId: existing.messId,
+            type: 'payment_updated',
+            title: 'Payment Updated',
+            message: `Manager updated a ${updates.category || existing.category} payment record for you.`,
+            link: `/dashboard/payments`
+          })
+          console.log(`[NOTIFICATION] payment_updated created for user ${affectedMember.userId} in mess ${existing.messId}`)
+        }
+
         return res.send({ success: true })
       } catch (err) {
         console.error(err)
@@ -2949,7 +3301,37 @@ async function run() {
         return res.status(403).send({ message: 'Only managers can delete payments.' })
       }
 
+      // Check if month is closed
+      const dateObj = new Date(existing.date)
+      const monthStr = `${dateObj.getUTCFullYear()}-${String(dateObj.getUTCMonth() + 1).padStart(2, '0')}`
+      const closedMonth = await monthlyReportsCollections.findOne({
+        messId: existing.messId,
+        month: monthStr
+      })
+      if (closedMonth) {
+        return res.status(400).send({ message: 'This month is already closed and cannot be modified.' })
+      }
+
       try {
+        // NOTIFICATION: payment_deleted → notify the affected member BEFORE deleting
+        const affectedMember = await messMemberCollections.findOne({
+          userId: existing.userId,
+          messId: existing.messId,
+          status: 'active'
+        })
+
+        if (affectedMember) {
+          await createNotification({
+            userId: affectedMember.userId,
+            messId: existing.messId,
+            type: 'payment_deleted',
+            title: 'Payment Deleted',
+            message: `Manager removed a ${existing.category} payment record.`,
+            link: `/dashboard/payments`
+          })
+          console.log(`[NOTIFICATION] payment_deleted created for user ${affectedMember.userId} in mess ${existing.messId}`)
+        }
+
         await paymentsCollections.deleteOne({ _id: paymentObjectId })
         return res.send({ success: true })
       } catch (err) {
@@ -3228,6 +3610,786 @@ async function run() {
       } catch (err) {
         console.error(err)
         return res.status(500).send({ message: 'Failed to calculate settlement.' })
+      }
+    })
+
+    // =====================================================
+    // NOTIFICATIONS SYSTEM
+    // =====================================================
+
+    // Helper function to create notifications
+    const createNotification = async ({ userId, messId, type, title, message, link }) => {
+      try {
+        console.log('[Notification] Creating notification:', { 
+          userId: userId?.toString(), 
+          messId: messId?.toString(), 
+          type, 
+          title 
+        })
+        
+        const result = await notificationsCollections.insertOne({
+          userId,
+          messId,
+          type,
+          title,
+          message,
+          link,
+          isRead: false,
+          createdAt: new Date()
+        })
+        
+        console.log('[Notification] Created successfully with ID:', result.insertedId?.toString())
+      } catch (err) {
+        console.error('[Notification] Failed to create notification:', err)
+        console.error('[Notification] Details:', { userId, messId, type, title, message, link })
+      }
+    }
+
+    // GET /notifications?email=userEmail
+    // Returns current user's notifications for their current active Mess
+    app.get('/notifications', async (req, res) => {
+      const { ObjectId } = require('mongodb')
+      const { email } = req.query
+      
+      console.log('[Notification API] Fetching notifications for email:', email)
+      
+      if (!email) return res.status(400).send({ message: 'Email is required.' })
+
+      try {
+        // Get user
+        const user = await userCollections.findOne({ email })
+        if (!user) {
+          console.log('[Notification API] User not found')
+          return res.status(404).send({ message: 'User not found.' })
+        }
+        
+        console.log('[Notification API] User found:', user._id?.toString())
+
+        // Get current active mess membership
+        const membership = await messMemberCollections.findOne({ userId: user._id, status: 'active' })
+        if (!membership) {
+          console.log('[Notification API] No active mess membership found')
+          return res.status(200).send([]) // No active mess, no notifications
+        }
+        
+        console.log('[Notification API] Active membership found. MessId:', membership.messId?.toString())
+
+        // Get notifications for this user + mess, sorted newest first
+        const notifications = await notificationsCollections.find({
+          userId: user._id,
+          messId: membership.messId
+        }).sort({ createdAt: -1 }).toArray()
+        
+        console.log('[Notification API] Found notifications:', notifications.length)
+
+        res.status(200).send(notifications)
+      } catch (err) {
+        console.error('[Notification API] Error:', err)
+        res.status(500).send({ message: 'Failed to fetch notifications.' })
+      }
+    })
+
+    // GET /notifications/unread-count?email=userEmail
+    // Returns unread count for current user's active mess
+    app.get('/notifications/unread-count', async (req, res) => {
+      const { ObjectId } = require('mongodb')
+      const { email } = req.query
+      
+      console.log('[Notification API] Fetching unread count for email:', email)
+      
+      if (!email) return res.status(400).send({ message: 'Email is required.' })
+
+      try {
+        // Get user
+        const user = await userCollections.findOne({ email })
+        if (!user) {
+          console.log('[Notification API] User not found for unread count')
+          return res.status(404).send({ message: 'User not found.' })
+        }
+
+        // Get current active mess membership
+        const membership = await messMemberCollections.findOne({ userId: user._id, status: 'active' })
+        if (!membership) {
+          console.log('[Notification API] No active membership for unread count')
+          return res.status(200).send({ unreadCount: 0 })
+        }
+
+        // Count unread notifications
+        const unreadCount = await notificationsCollections.countDocuments({
+          userId: user._id,
+          messId: membership.messId,
+          isRead: false
+        })
+        
+        console.log('[Notification API] Unread count:', unreadCount)
+
+        res.status(200).send({ unreadCount })
+      } catch (err) {
+        console.error('[Notification API] Error fetching unread count:', err)
+        res.status(500).send({ message: 'Failed to fetch unread count.' })
+      }
+    })
+
+    // PATCH /notifications/:id/read
+    // Mark one notification as read
+    app.patch('/notifications/:id/read', async (req, res) => {
+      const { ObjectId } = require('mongodb')
+      const { id } = req.params
+      const { email } = req.body
+
+      if (!email) return res.status(400).send({ message: 'Email is required.' })
+
+      try {
+        const user = await userCollections.findOne({ email })
+        if (!user) return res.status(404).send({ message: 'User not found.' })
+
+        let notificationId
+        try {
+          notificationId = new ObjectId(id)
+        } catch {
+          return res.status(400).send({ message: 'Invalid notification ID.' })
+        }
+
+        // Verify ownership
+        const notification = await notificationsCollections.findOne({ _id: notificationId })
+        if (!notification) return res.status(404).send({ message: 'Notification not found.' })
+        if (!notification.userId.equals(user._id)) {
+          return res.status(403).send({ message: 'You cannot modify another user\'s notification.' })
+        }
+
+        // Mark as read
+        await notificationsCollections.updateOne(
+          { _id: notificationId },
+          { $set: { isRead: true } }
+        )
+
+        res.status(200).send({ message: 'Notification marked as read.' })
+      } catch (err) {
+        console.error(err)
+        res.status(500).send({ message: 'Failed to mark notification as read.' })
+      }
+    })
+
+    // PATCH /notifications/read-all
+    // Mark all notifications as read for current user's active mess
+    app.patch('/notifications/read-all', async (req, res) => {
+      const { ObjectId } = require('mongodb')
+      const { email } = req.body
+
+      if (!email) return res.status(400).send({ message: 'Email is required.' })
+
+      try {
+        const user = await userCollections.findOne({ email })
+        if (!user) return res.status(404).send({ message: 'User not found.' })
+
+        const membership = await messMemberCollections.findOne({ userId: user._id, status: 'active' })
+        if (!membership) return res.status(200).send({ message: 'No active mess.' })
+
+        // Mark all unread as read
+        const result = await notificationsCollections.updateMany(
+          { userId: user._id, messId: membership.messId, isRead: false },
+          { $set: { isRead: true } }
+        )
+
+        res.status(200).send({ message: 'All notifications marked as read.', count: result.modifiedCount })
+      } catch (err) {
+        console.error(err)
+        res.status(500).send({ message: 'Failed to mark all as read.' })
+      }
+    })
+
+    // =====================================================
+    // MONTH CLOSING & HISTORICAL REPORTS
+    // =====================================================
+
+    // POST /close-month/:messId — Close a calendar month and create historical snapshot
+    app.post('/close-month/:messId', async (req, res) => {
+      const { ObjectId } = require('mongodb')
+      const { email, month, selectedMemberIds } = req.body
+
+      if (!email) return res.status(400).send({ message: 'email is required.' })
+      if (!month) return res.status(400).send({ message: 'month is required.' })
+      if (!/^\d{4}-\d{2}$/.test(month)) {
+        return res.status(400).send({ message: 'month must be in YYYY-MM format.' })
+      }
+
+      let messObjectId
+      try { messObjectId = new ObjectId(req.params.messId) }
+      catch { return res.status(400).send({ message: 'Invalid mess ID.' }) }
+
+      try {
+        // 1. Verify authenticated user
+        const caller = await userCollections.findOne({ email })
+        if (!caller) return res.status(404).send({ message: 'User not found.' })
+
+        // 2. Verify user is the active Manager
+        const managerMembership = await messMemberCollections.findOne({
+          userId: caller._id,
+          messId: messObjectId,
+          role: 'manager',
+          status: 'active',
+        })
+        if (!managerMembership) {
+          return res.status(403).send({ message: 'Only the active manager can close a month.' })
+        }
+
+        // 3. Check if month is already closed
+        const existingReport = await monthlyReportsCollections.findOne({
+          messId: messObjectId,
+          month
+        })
+        if (existingReport) {
+          return res.status(400).send({ message: 'This month is already closed.' })
+        }
+
+        // 4. Get mess info
+        const mess = await messCollections.findOne({ _id: messObjectId })
+        if (!mess) return res.status(404).send({ message: 'Mess not found.' })
+
+        // 5. Calculate monthly snapshot using EXISTING calculation logic
+        const [year, monthNum] = month.split('-').map(Number)
+        const startDate = new Date(Date.UTC(year, monthNum - 1, 1))
+        const endDate = new Date(Date.UTC(year, monthNum, 1))
+
+        // Get active members at time of closing
+        const activeMembers = await messMemberCollections
+          .find({ messId: messObjectId, status: 'active' })
+          .toArray()
+        
+        const memberIds = activeMembers.map(m => m.userId)
+        
+        // Populate member user info
+        const memberUsers = await userCollections
+          .find({ _id: { $in: memberIds } })
+          .project({ name: 1, email: 1, photoURL: 1 })
+          .toArray()
+        
+        const memberMap = {}
+        memberUsers.forEach(u => {
+          memberMap[u._id.toString()] = u
+        })
+
+        // Get approved bazar total
+        const approvedBazar = await bazarCollections
+          .find({
+            messId: messObjectId,
+            date: { $gte: startDate, $lt: endDate },
+            status: 'approved'
+          })
+          .toArray()
+        
+        const totalBazarCost = approvedBazar.reduce((sum, b) => sum + b.totalAmount, 0)
+
+        // Get meal documents
+        const mealDocs = await mealCollections
+          .find({
+            messId: messObjectId,
+            date: { $gte: startDate, $lt: endDate }
+          })
+          .toArray()
+
+        // Calculate total meals and member-wise meals
+        let totalMeals = 0
+        const memberMeals = {}
+        
+        memberIds.forEach(id => {
+          memberMeals[id.toString()] = {
+            breakfast: 0,
+            lunch: 0,
+            dinner: 0,
+            guestMeal: 0,
+            total: 0
+          }
+        })
+
+        mealDocs.forEach(doc => {
+          if (doc.entries && Array.isArray(doc.entries)) {
+            doc.entries.forEach(entry => {
+              const key = entry.userId.toString()
+              if (memberMeals[key]) {
+                const breakfast = Number(entry.breakfast || 0)
+                const lunch = Number(entry.lunch || 0)
+                const dinner = Number(entry.dinner || 0)
+                const guestMeal = Number(entry.guestMeal || 0)
+                
+                memberMeals[key].breakfast += breakfast
+                memberMeals[key].lunch += lunch
+                memberMeals[key].dinner += dinner
+                memberMeals[key].guestMeal += guestMeal
+                memberMeals[key].total += breakfast + lunch + dinner + guestMeal
+              }
+            })
+          }
+        })
+
+        Object.values(memberMeals).forEach(m => {
+          totalMeals += m.total
+        })
+
+        const mealRate = totalMeals > 0 ? totalBazarCost / totalMeals : 0
+
+        // Get khalabill
+        const khalabill = await khalabillCollections.findOne({
+          messId: messObjectId,
+          month
+        })
+        
+        const totalKhalabill = khalabill?.amount || 0
+        const perMemberKhalabill = activeMembers.length > 0 ? totalKhalabill / activeMembers.length : 0
+
+        // Get common expenses
+        const commonExpenses = await commonExpensesCollections
+          .find({
+            messId: messObjectId,
+            date: { $gte: startDate, $lt: endDate }
+          })
+          .toArray()
+        
+        const totalCommonExpense = commonExpenses.reduce((sum, e) => sum + e.amount, 0)
+        const perMemberCommonExpense = activeMembers.length > 0 ? totalCommonExpense / activeMembers.length : 0
+
+        // Get member rents
+        const rents = await memberRentCollections
+          .find({
+            messId: messObjectId,
+            month
+          })
+          .toArray()
+        
+        const memberRents = {}
+        let totalRent = 0
+        rents.forEach(r => {
+          memberRents[r.userId.toString()] = r.amount
+          totalRent += r.amount
+        })
+
+        // Get payments
+        const payments = await paymentsCollections
+          .find({
+            messId: messObjectId,
+            date: { $gte: startDate, $lt: endDate }
+          })
+          .toArray()
+
+        const memberPayments = {}
+        const memberPaymentsByCategory = {}
+        
+        memberIds.forEach(id => {
+          const key = id.toString()
+          memberPayments[key] = 0
+          memberPaymentsByCategory[key] = {
+            meal: 0,
+            rent: 0,
+            khalabill: 0,
+            common_expense: 0,
+            other: 0
+          }
+        })
+
+        payments.forEach(p => {
+          const key = p.userId.toString()
+          if (memberPayments[key] !== undefined) {
+            memberPayments[key] += p.amount
+            if (memberPaymentsByCategory[key][p.category] !== undefined) {
+              memberPaymentsByCategory[key][p.category] += p.amount
+            }
+          }
+        })
+
+        const totalPaid = payments.reduce((sum, p) => sum + p.amount, 0)
+
+        // Build member settlement snapshot
+        const memberSettlement = memberIds.map(userId => {
+          const key = userId.toString()
+          const user = memberMap[key]
+          const foodCost = (memberMeals[key]?.total || 0) * mealRate
+          const rent = memberRents[key] || 0
+          const khalabill = perMemberKhalabill
+          const commonExpense = perMemberCommonExpense
+          const totalCost = foodCost + rent + khalabill + commonExpense
+          const paid = memberPayments[key] || 0
+          const balance = totalCost - paid
+          
+          let status = 'Settled'
+          if (balance > 0.01) status = 'Due'
+          else if (balance < -0.01) status = 'Advance'
+
+          return {
+            userId: userId,
+            name: user?.name || 'Unknown',
+            email: user?.email || '',
+            meals: {
+              breakfast: memberMeals[key].breakfast,
+              lunch: memberMeals[key].lunch,
+              dinner: memberMeals[key].dinner,
+              guestMeal: memberMeals[key].guestMeal,
+              total: memberMeals[key].total
+            },
+            foodCost,
+            rent,
+            khalabill,
+            commonExpense,
+            totalCost,
+            totalPaid: paid,
+            balance,
+            status
+          }
+        })
+
+        let totalDue = 0
+        let totalAdvance = 0
+        memberSettlement.forEach(m => {
+          if (m.status === 'Due') totalDue += m.balance
+          else if (m.status === 'Advance') totalAdvance += Math.abs(m.balance)
+        })
+
+        const totalCost = totalBazarCost + totalRent + totalKhalabill + totalCommonExpense
+
+        // 6. Create monthly report snapshot
+        const monthlyReportDoc = {
+          messId: messObjectId,
+          month,
+          status: 'closed',
+          closedAt: new Date(),
+          closedBy: caller._id,
+          summary: {
+            totalMeals,
+            totalBazarCost,
+            mealRate,
+            totalKhalabill,
+            totalCommonExpense,
+            totalRent,
+            totalPayments: totalPaid,
+            totalCost,
+            totalDue,
+            totalAdvance,
+            activeMemberCount: activeMembers.length
+          },
+          members: memberSettlement
+        }
+
+        await monthlyReportsCollections.insertOne(monthlyReportDoc)
+
+        // 7. Process member removals
+        const removedMembers = []
+        if (Array.isArray(selectedMemberIds) && selectedMemberIds.length > 0) {
+          // Validate selected members
+          const selectedIds = []
+          for (const id of selectedMemberIds) {
+            try {
+              const objId = new ObjectId(id)
+              selectedIds.push(objId)
+            } catch {
+              return res.status(400).send({ message: `Invalid member ID: ${id}` })
+            }
+          }
+
+          // Prevent manager from removing themselves
+          const managerIdStr = caller._id.toString()
+          if (selectedIds.some(id => id.toString() === managerIdStr)) {
+            return res.status(400).send({ message: 'Manager cannot remove themselves.' })
+          }
+
+          // Get members to remove
+          const membersToRemove = await messMemberCollections
+            .find({
+              userId: { $in: selectedIds },
+              messId: messObjectId,
+              status: 'active'
+            })
+            .toArray()
+
+          // Remove members (set status to inactive)
+          for (const member of membersToRemove) {
+            await messMemberCollections.updateOne(
+              { _id: member._id },
+              { 
+                $set: { 
+                  status: 'inactive',
+                  leftAt: new Date(),
+                  updatedAt: new Date()
+                } 
+              }
+            )
+
+            // Update user's hasMess flag
+            await userCollections.updateOne(
+              { _id: member.userId },
+              { $set: { hasMess: false, updatedAt: new Date() } }
+            )
+
+            removedMembers.push(member)
+
+            // Create notification for removed member
+            await createNotification({
+              userId: member.userId,
+              messId: messObjectId,
+              type: 'removed_from_mess',
+              title: 'Removed from Mess',
+              message: `You have been removed from ${mess.messName}. Your finalized monthly report for ${month} has been preserved.`,
+              link: '/dashboard'
+            })
+          }
+        }
+
+        return res.send({ 
+          success: true, 
+          message: 'Month closed successfully.',
+          removedCount: removedMembers.length
+        })
+      } catch (err) {
+        console.error('Failed to close month:', err)
+        return res.status(500).send({ message: 'Failed to close month.' })
+      }
+    })
+
+    // GET /monthly-reports/:messId — Get all historical reports for a mess
+    app.get('/monthly-reports/:messId', async (req, res) => {
+      const { ObjectId } = require('mongodb')
+      const { email } = req.query
+
+      if (!email) return res.status(400).send({ message: 'email is required.' })
+
+      let messObjectId
+      try { messObjectId = new ObjectId(req.params.messId) }
+      catch { return res.status(400).send({ message: 'Invalid mess ID.' }) }
+
+      try {
+        const caller = await userCollections.findOne({ email })
+        if (!caller) return res.status(404).send({ message: 'User not found.' })
+
+        // Verify user is member of this mess
+        const membership = await messMemberCollections.findOne({
+          userId: caller._id,
+          messId: messObjectId,
+          status: 'active',
+        })
+        if (!membership) {
+          return res.status(403).send({ message: 'You are not a member of this mess.' })
+        }
+
+        // If manager, return all reports; if member, return only their reports
+        if (membership.role === 'manager') {
+          const reports = await monthlyReportsCollections
+            .find({ messId: messObjectId })
+            .sort({ closedAt: -1 })
+            .toArray()
+          
+          return res.send({ reports })
+        } else {
+          // Member can only see their own data
+          const reports = await monthlyReportsCollections
+            .find({ messId: messObjectId })
+            .sort({ closedAt: -1 })
+            .toArray()
+          
+          // Filter to only include member's own data
+          const memberReports = reports.map(report => {
+            const memberData = report.members.find(m => m.userId.toString() === caller._id.toString())
+            if (!memberData) return null
+            
+            return {
+              _id: report._id,
+              month: report.month,
+              closedAt: report.closedAt,
+              memberData
+            }
+          }).filter(Boolean)
+          
+          return res.send({ reports: memberReports })
+        }
+      } catch (err) {
+        console.error('Failed to fetch historical reports:', err)
+        return res.status(500).send({ message: 'Failed to fetch historical reports.' })
+      }
+    })
+
+    // GET /monthly-reports/:messId/:month — Get specific month report
+    app.get('/monthly-reports/:messId/:month', async (req, res) => {
+      const { ObjectId } = require('mongodb')
+      const { email } = req.query
+      const { month } = req.params
+
+      if (!email) return res.status(400).send({ message: 'email is required.' })
+      if (!/^\d{4}-\d{2}$/.test(month)) {
+        return res.status(400).send({ message: 'month must be in YYYY-MM format.' })
+      }
+
+      let messObjectId
+      try { messObjectId = new ObjectId(req.params.messId) }
+      catch { return res.status(400).send({ message: 'Invalid mess ID.' }) }
+
+      try {
+        const caller = await userCollections.findOne({ email })
+        if (!caller) return res.status(404).send({ message: 'User not found.' })
+
+        const membership = await messMemberCollections.findOne({
+          userId: caller._id,
+          messId: messObjectId,
+          status: 'active',
+        })
+        if (!membership) {
+          return res.status(403).send({ message: 'You are not a member of this mess.' })
+        }
+
+        const report = await monthlyReportsCollections.findOne({
+          messId: messObjectId,
+          month
+        })
+
+        if (!report) {
+          return res.status(404).send({ message: 'Report not found.' })
+        }
+
+        // If manager, return full report; if member, return only their data
+        if (membership.role === 'manager') {
+          return res.send({ report })
+        } else {
+          const memberData = report.members.find(m => m.userId.toString() === caller._id.toString())
+          if (!memberData) {
+            return res.status(404).send({ message: 'Your data not found in this report.' })
+          }
+          
+          return res.send({ 
+            report: {
+              _id: report._id,
+              month: report.month,
+              closedAt: report.closedAt,
+              summary: report.summary,
+              memberData
+            }
+          })
+        }
+      } catch (err) {
+        console.error('Failed to fetch month report:', err)
+        return res.status(500).send({ message: 'Failed to fetch month report.' })
+      }
+    })
+
+    // GET /month-status/:messId/:month — Check if a month is closed
+    app.get('/month-status/:messId/:month', async (req, res) => {
+      const { ObjectId } = require('mongodb')
+      const { month } = req.params
+
+      if (!/^\d{4}-\d{2}$/.test(month)) {
+        return res.status(400).send({ message: 'month must be in YYYY-MM format.' })
+      }
+
+      let messObjectId
+      try { messObjectId = new ObjectId(req.params.messId) }
+      catch { return res.status(400).send({ message: 'Invalid mess ID.' }) }
+
+      try {
+        const report = await monthlyReportsCollections.findOne({
+          messId: messObjectId,
+          month
+        })
+
+        return res.send({ 
+          isClosed: !!report,
+          closedAt: report?.closedAt || null
+        })
+      } catch (err) {
+        console.error('Failed to check month status:', err)
+        return res.status(500).send({ message: 'Failed to check month status.' })
+      }
+    })
+
+    // =====================================================
+    // MANAGER CHANGE
+    // =====================================================
+
+    // POST /change-manager/:messId — Transfer manager role to another active member
+    app.post('/change-manager/:messId', async (req, res) => {
+      const { ObjectId } = require('mongodb')
+      const { email, newManagerUserId } = req.body
+
+      if (!email) return res.status(400).send({ message: 'email is required.' })
+      if (!newManagerUserId) return res.status(400).send({ message: 'newManagerUserId is required.' })
+
+      let messObjectId
+      try { messObjectId = new ObjectId(req.params.messId) }
+      catch { return res.status(400).send({ message: 'Invalid mess ID.' }) }
+
+      let newManagerUserObjectId
+      try { newManagerUserObjectId = new ObjectId(newManagerUserId) }
+      catch { return res.status(400).send({ message: 'Invalid new manager user ID.' }) }
+
+      try {
+        // Verify current user is the active manager
+        const caller = await userCollections.findOne({ email })
+        if (!caller) return res.status(404).send({ message: 'User not found.' })
+
+        const currentManagerMembership = await messMemberCollections.findOne({
+          userId: caller._id,
+          messId: messObjectId,
+          role: 'manager',
+          status: 'active',
+        })
+        if (!currentManagerMembership) {
+          return res.status(403).send({ message: 'Only the active manager can change managers.' })
+        }
+
+        // Cannot change to self
+        if (caller._id.toString() === newManagerUserObjectId.toString()) {
+          return res.status(400).send({ message: 'You are already the manager.' })
+        }
+
+        // Verify new manager is an active member
+        const newManagerMembership = await messMemberCollections.findOne({
+          userId: newManagerUserObjectId,
+          messId: messObjectId,
+          status: 'active',
+        })
+        if (!newManagerMembership) {
+          return res.status(400).send({ message: 'Selected user is not an active member of this mess.' })
+        }
+
+        // Get mess info for notifications
+        const mess = await messCollections.findOne({ _id: messObjectId })
+        if (!mess) return res.status(404).send({ message: 'Mess not found.' })
+
+        const now = new Date()
+
+        // Downgrade current manager to member
+        await messMemberCollections.updateOne(
+          { _id: currentManagerMembership._id },
+          { $set: { role: 'member', updatedAt: now } }
+        )
+
+        // Upgrade new member to manager
+        await messMemberCollections.updateOne(
+          { _id: newManagerMembership._id },
+          { $set: { role: 'manager', updatedAt: now } }
+        )
+
+        // Notify new manager
+        await createNotification({
+          userId: newManagerUserObjectId,
+          messId: messObjectId,
+          type: 'manager_changed',
+          title: 'You Are Now the Manager',
+          message: `You have been appointed as the manager of ${mess.messName}.`,
+          link: '/dashboard'
+        })
+
+        // Notify previous manager
+        await createNotification({
+          userId: caller._id,
+          messId: messObjectId,
+          type: 'manager_changed',
+          title: 'Manager Role Changed',
+          message: `Your role in ${mess.messName} has been changed to Member.`,
+          link: '/dashboard'
+        })
+
+        return res.send({ 
+          success: true, 
+          message: 'Manager changed successfully.' 
+        })
+      } catch (err) {
+        console.error('Failed to change manager:', err)
+        return res.status(500).send({ message: 'Failed to change manager.' })
       }
     })
 
